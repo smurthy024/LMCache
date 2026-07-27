@@ -355,6 +355,7 @@ class GPUCacheContext(BaseCacheContext):
         engine_type: EngineType = EngineType.VLLM,
         separate_object_groups: bool = False,
         full_sw_kv: bool = False,
+        max_batch_size: int = 4,
     ):
         # Kept for close(): raw-IPC wrappers hold driver-level mappings
         # that pin the exporter's device memory until explicitly closed.
@@ -368,6 +369,7 @@ class GPUCacheContext(BaseCacheContext):
                 engine_type,
                 separate_object_groups,
                 full_sw_kv,
+                max_batch_size,
             )
         except BaseException:
             # Partial construction may have imported some mappings
@@ -385,6 +387,7 @@ class GPUCacheContext(BaseCacheContext):
         engine_type: EngineType,
         separate_object_groups: bool,
         full_sw_kv: bool,
+        max_batch_size: int = 4,
     ) -> None:
         """Body of ``__init__``; split out so the constructor can roll
         back partially imported KV mappings on failure.
@@ -440,7 +443,7 @@ class GPUCacheContext(BaseCacheContext):
             kv_layer_groups_manager=self.kv_layer_groups_manager_,
             lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
             device=self.device_,
-            max_batch_size=4,
+            max_batch_size=max_batch_size,
         )
 
         # GPU streams
@@ -467,8 +470,10 @@ class GPUCacheContext(BaseCacheContext):
         )
 
     def close(self) -> None:
-        """Drain the context stream, deregister the GDS staging buffer and
-        release the imported KV mappings (reverse of __init__).
+        """Drain the context stream, deregister the GDS staging buffer,
+        release the imported KV mappings, and drop every reference that
+        pins CUDA-IPC-imported memory or holds a GPU stream handle
+        (reverse of __init__).
 
         The stream is synchronized first so no in-flight kernel still
         touches the mappings when they are unmapped. The wrapper close
@@ -477,11 +482,30 @@ class GPUCacheContext(BaseCacheContext):
         The tensors built over those mappings must not be dereferenced
         afterwards -- the caller (``_release_entries``) drops the context
         right after this call.
+
+        Beyond the wrapper close, this method also explicitly nulls the
+        pointer tensors, temp buffer, and CUDA/CuPy streams. CuPy's
+        ``ExternalStream`` creates a reference cycle (stream → context →
+        stream) that prevents CPython's reference-counting from
+        collecting the wrapper, so the IPC handle would otherwise stay
+        open until the next full GC pass -- and if ``py_enable_gc`` is
+        ``False`` the handle leaks permanently.
         """
         self.cuda_stream_.synchronize()
         with torch_dev.stream(self.cuda_stream_):
             get_gds_context().deregister_gpu_buffer(self._temp_buffer.buffer)
         self._close_kv_wrappers()
+
+        # Explicitly release every reference that pins CUDA-IPC-imported
+        # memory or holds a GPU stream handle. The CuPy ExternalStream
+        # creates a reference cycle (cupy_stream_ -> cuda_stream_ -> self)
+        # that blocks refcount-based collection; nulling these fields
+        # breaks the cycle so the IPC handle is freed promptly.
+        self.group_kv_pointers_ = None
+        self.kv_caches_ = None
+        self._temp_buffer = None
+        self.cupy_stream_ = None
+        self.cuda_stream_ = None
 
     def _close_kv_wrappers(self) -> None:
         """Close every KV wrapper, continuing past per-wrapper failures."""
