@@ -53,6 +53,24 @@ class EngineGroupInfo(msgspec.Struct, frozen=True):
     """Sliding window size in tokens for the layers of this group.
     ``-1`` means the layers are not sliding-window attention."""
 
+    standalone_object_group: bool = False
+    """Whether this group must form its own object group under
+    ``--separate-object-groups`` instead of being bucketed by window size.
+    Set for connector-private groups (e.g. the CacheBlend fused-aux pool)
+    whose bytes must never share an object layout with groups that a
+    differently-registered client may read. msgspec encodes structs as maps,
+    so an old payload without this field decodes with the default ``False``
+    (same wire-compatibility pattern as ``IPCCacheServerKey.cache_salt``)."""
+
+    recurrent_state: bool = False
+    """Whether this group's pages hold recurrent state snapshots
+    (Mamba/GDN conv+SSM pages) rather than per-token attention KV. Its
+    one-block window (``sw_size_tokens``) then reflects restore semantics
+    (only the last matched block's page is ever consumed) instead of an
+    attention pattern, so blend-mode full-window forcing must not widen it.
+    Wire-compatible via the msgspec defaulted-field pattern (see
+    ``standalone_object_group``)."""
+
 
 def num_engine_groups(groups: Sequence[EngineGroupInfo]) -> int:
     """Return the number of engine groups (block-id lists per transfer request).

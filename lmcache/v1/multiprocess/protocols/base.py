@@ -88,6 +88,25 @@ class RequestType(enum.Enum):
     CB_RETRIEVE_PRE_COMPUTED_V3 = enum.auto()
     CB_UNIFIED_LOOKUP = enum.auto()
 
+    # Generic auxiliary-blob store for the CacheBlend GDN path: opaque per-chunk
+    # tensors (SVD-compressed GDN projections) alongside KV; server is data-type
+    # agnostic. AUX_PUT stores; AUX_GET_BY_HASH_IPC retrieves fingerprint-keyed
+    # chunks by copying them straight into a worker-exported GPU buffer over
+    # CUDA IPC (same physical GPU — no D2H/ZMQ-bytes/H2D round-trip), gated by a
+    # CUDA event. Mirrors CB_RETRIEVE_PRE_COMPUTED_V3.
+    AUX_PUT = enum.auto()
+    AUX_GET_BY_HASH_IPC = enum.auto()
+
+    # CacheBlend prompt-end state snapshots (recurrent-state hybrids): a
+    # prefiller persists the request's conv/SSM state at END OF PREFILL plus
+    # the unaligned tail-sliver KV rows, keyed by the prompt's chunk-hash
+    # chain. A later request whose prompt strictly extends a stored prompt
+    # restores the state and forwards only the appended suffix (multi-turn
+    # append). PUT ships the blob over CUDA IPC; the hit is reported by
+    # CB_UNIFIED_LOOKUP; GET copies the blob into a worker-exported buffer.
+    CB_SNAPSHOT_PUT = enum.auto()
+    CB_SNAPSHOT_GET = enum.auto()
+
     # P2P operations
     P2P_LOOKUP_AND_LOCK = enum.auto()
     P2P_QUERY_LOOKUP_RESULTS = enum.auto()

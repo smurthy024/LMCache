@@ -112,8 +112,20 @@ At KV-cache registration LMCache can bucket a hybrid model's layers into
 **object groups** — the unit it stores and retrieves as one object. With
 ``--separate-object-groups`` each distinct cross-chunk attention window becomes
 its own object group: full-attention layers form one group, and each
-sliding-window size (mamba / GDN included) forms another. The default is
-**off** — every layer shares a single full-attention object group.
+sliding-window size (mamba / GDN included) forms another. Recurrent-state
+(mamba / GDN) layers never share an object group with sliding-window attention
+layers even when their windows coincide, and connector-private pools (the
+CacheBlend fused-aux pool) always bucket alone. The default is **off** — every
+layer shares a single full-attention object group.
+
+Object groups are numbered in registration order (by each group's first
+layer), **not** by kind: for Nemotron-H the 23 mamba layers register before the
+6 attention layers, so object group 0 is the recurrent group and group 1 is
+attention. Consumers must therefore select a group by kind
+(``AttnWindowDesc.group_kinds``), never assume group 0 is attention. Because a
+connector-private pool always sorts last, two clients that register the same
+model differ only in the extra trailing group — so a client without the pool
+reads the shared groups at identical ids.
 
 .. code-block:: bash
 
@@ -258,8 +270,15 @@ Caveats
   backends do not support vLLM's batch-invariant mode. Validate with a
   **score-level** comparison (see `Verifying Correctness`_), not a token-level
   diff.
-- The cached pages are **byte-opaque**, so content-aware features (CacheGen
-  compression, CacheBlend) do not apply, and cache entries must not be shared
+- The recurrent-state pages are **byte-opaque**, so content-aware features
+  (CacheGen compression, CacheBlend blending) do not apply to *them*. A
+  ``--engine-type blend`` server may still run with
+  ``--separate-object-groups``: CacheBlend resolves its read set per
+  registration (the full-attention object group plus its own fused-aux group)
+  and never reads or writes recurrent-state groups, while the blend engine's
+  full-window forcing is scoped to attention-pattern groups so the
+  recurrent group keeps its one-block restore window. Cache entries must not
+  be shared
   across engines with different attention backends or kernel block sizes.
 - Several of these models are **vision-language** (they load a vision tower).
   The validated, supported path is **text** KV caching; image/video KV caching

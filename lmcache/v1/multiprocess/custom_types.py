@@ -207,6 +207,20 @@ class CBUnifiedLookupResult:
     prefix_coverage_tokens: int
     non_prefix_segments: list[CBMatchResult]
     segmented_prefix_segments: list[CBMatchResult] = field(default_factory=list)
+    # Prompt-end state snapshot hit (recurrent-state hybrids): a stored
+    # prompt is a STRICT prefix of this query. ``snapshot_tokens`` is the
+    # stored prompt's full length (last chunk boundary + unaligned tail);
+    # 0 = no snapshot. ``snapshot_sizes`` are the opaque blob's section
+    # byte lengths, echoed from CB_SNAPSHOT_PUT so the worker can size its
+    # receive buffer and split the payload. The blob itself moves via
+    # CB_SNAPSHOT_GET.
+    snapshot_tokens: int = 0
+    snapshot_sizes: list[int] = field(default_factory=list)
+    # Chain hashes of the covered whole chunks, so the worker can load their
+    # KV through the synchronous CB retrieve (hash-addressed) instead of the
+    # deferred prefix leg — measured 8 ms of transfer vs ~800 ms of
+    # WAITING_FOR_REMOTE_KVS round-trip for the same bytes.
+    snapshot_chunk_hashes: list[bytes] = field(default_factory=list)
 
 
 _CUSTOMERIZED_SERIALIZERS = {

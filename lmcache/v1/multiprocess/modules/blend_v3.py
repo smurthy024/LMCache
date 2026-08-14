@@ -11,10 +11,11 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 import threading
 import time
 import weakref
+import zlib
 
 if TYPE_CHECKING:
     # First Party
@@ -30,6 +31,7 @@ from lmcache import device_ops, torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.utils import check_interprocess_event_support
 from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
     MemoryLayoutDesc,
     PrefetchRequestSpec,
     TrimPolicy,
@@ -52,6 +54,7 @@ from lmcache.v1.multiprocess.engine_module import (
     InstanceLivenessTarget,
     ThreadPoolType,
 )
+from lmcache.v1.multiprocess.modules.aux_store import AuxBlobStore
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
 )
@@ -72,11 +75,26 @@ logger = init_logger(__name__)
 #: call sites), so the log costs nothing after the first occurrence of each.
 _NOOP_REASONS_SEEN: set[str] = set()
 
+
+class _DeviceEvent(Protocol):
+    """The device-event surface the retrieve barrier needs.
+
+    ``torch_dev.Event`` satisfies this on every platform; declaring it as a
+    protocol keeps the annotation typed without naming a device-specific
+    class (see ``lmcache.v1.platform``).
+    """
+
+    def record(self) -> None: ...
+
+    def synchronize(self) -> None: ...
+
+
 # Plan-then-execute retrieve: one native call enqueues all fill/rope/scatter
 # in a single GIL release, with the plan encoded as numpy int64 tables (one
 # pybind crossing). The Python wave loop stays as fallback for cuda_ops builds
 # that predate the op (and for inputs the planner declines).
 _HAS_NATIVE_RETRIEVE_PLAN = hasattr(device_ops, "execute_cb_retrieve_plan_flat")
+
 
 # torch dtype -> at::ScalarType (rope dispatch); missing -> Python fallback.
 _TORCH_TO_AT_SCALAR = {
@@ -130,6 +148,12 @@ class _CBRopeState:
             declared map). Legacy registrations (empty ``group_rot``) get
             ``(0, head_size)``.
 
+        Note:
+            This answers only "what window would rotate", independent of
+            whether a cos/sin cache exists — a NoPE model (no caches at all)
+            is a separate axis, checked against ``cos_sin_caches`` by the
+            consumers.
+
         Raises:
             RuntimeError: If ``engine_group_idx`` is outside a non-empty map.
         """
@@ -144,22 +168,26 @@ class _CBRopeState:
             )
         return self.group_rot[engine_group_idx]
 
-    def cache_for_group(self, engine_group_idx: int) -> torch.Tensor:
+    def cache_for_group(self, engine_group_idx: int) -> "torch.Tensor | None":
         """The cos/sin cache for one engine group.
 
         Engine groups partition layers by attention type, and rope follows
         attention type (sliding=local theta, full=global theta),
-        so each engine group has exactly one cache.
+        so each engine group has exactly one cache. NoPE models (e.g.
+        NemotronH, whose attention layers apply no rotary at all) register
+        zero caches; every group then returns ``None`` and re-RoPE is skipped.
 
         Args:
             engine_group_idx: The kernel group's engine group index.
 
         Returns:
-            The group's cos/sin cache tensor.
+            The group's cos/sin cache tensor, or ``None`` for a NoPE model.
 
         Raises:
             RuntimeError: If ``engine_group_idx`` is outside the map.
         """
+        if not self.cos_sin_caches:
+            return None
         if not self.group_to_cache:
             return self.cos_sin_caches[0]
         if engine_group_idx >= len(self.group_to_cache):
@@ -184,6 +212,7 @@ class _CBUnifiedJob:
     # there is no GPU context / no full chunk (poll reports 0 coverage).
     prefix_handle: PrefetchHandle | None = None
     prefix_world_size: int = 1
+    prefix_read_groups: int = 1  # object groups per chunk in the prefix keys
     prefix_chunks: int | None = None  # stashed when the prefix poll completes
     retained_chunks: list[int] | None = None  # SEGMENTED_PREFIX: full gapped set
     sparse_started: bool = False  # prefix done -> sparse leg submitted/skipped
@@ -195,6 +224,36 @@ class _CBUnifiedJob:
     l2_keys: int = 0  # sparse keys needing an L2 load (0 => no L2 read, span skipped)
     coord_submitted: bool = False  # coordinator match query was issued
     coord_deadline: float = 0.0  # time.monotonic() wall-clock cutoff for the leg
+    # Prompt-end snapshot hit riding this job: (covered_tokens, blob sizes,
+    # covered chunks' chain hashes); None on the normal lookup path.
+    snapshot: "tuple[int, list[int], list[bytes]] | None" = None
+
+
+#: Host-memory budget for stored prompt-end snapshots (LRU beyond it). One
+#: snapshot is all mamba layers' conv/SSM state plus a sub-chunk KV sliver —
+#: tens of MB for a 30B hybrid — so the default holds on the order of a
+#: hundred stored prompts.
+_CB_SNAPSHOT_CAP_BYTES = 4 << 30
+
+
+@dataclass
+class _CBSnapshot:
+    """One stored prompt-end state snapshot (see CB_SNAPSHOT_PUT).
+
+    Attributes:
+        covered_tokens: The stored prompt's full length — last full-chunk
+            boundary plus the unaligned tail. A query reuses the snapshot
+            only when its tokens strictly extend this prompt.
+        tail_tokens: The stored prompt's tokens past its last full-chunk
+            boundary (< chunk_size of them); verified against the query.
+        sizes: Opaque blob section byte lengths, echoed to the consumer.
+        blob: Host copy of the packed snapshot payload (uint8).
+    """
+
+    covered_tokens: int
+    tail_tokens: tuple[int, ...]
+    sizes: list[int]
+    blob: torch.Tensor
 
 
 class BlendTokenRangeMatcherV3:
@@ -227,6 +286,36 @@ class BlendTokenRangeMatcherV3:
         # V3 addition: compact_chunk_id -> full poly hash, for collision reject.
         self._chunk_poly_hash: list[int] = []
 
+    def _content_is_live(self, poly_hash: int) -> bool:
+        """Is a non-evicted chunk already registered for this exact content?
+
+        The token-hash dedup in ``on_new_token_hashes`` cannot answer this:
+        LMCache chains a token hash over the preceding tokens, so the same
+        chunk content stored behind a different preamble hashes differently
+        every time. A CacheBlend blend writes its result back and does exactly
+        that, so without a content-level check each blend registers another
+        generation of content the matcher already holds *and displaces the
+        previous one in the table* — the incumbent's object then ages out and
+        every later lookup classifies the content stale. Keeping the first
+        generation is also the cheaper choice: it is the one whose objects are
+        already warm.
+
+        Self-healing on eviction — ``remove_chunks`` clears both fields read
+        below, so once the incumbent object goes away the content is
+        registrable again by the next store that carries it.
+
+        Caller must hold ``self._lock``.
+        """
+        cid = int(self._table_id[poly_hash & int(self._mask)])
+        if cid < 0:
+            return False
+        # A shared slot can also mean a poly-hash collision, so compare the
+        # full hash; an evicted entry has its token hash cleared to None.
+        return (
+            self._chunk_token_hash[cid] is not None
+            and self._chunk_poly_hash[cid] == poly_hash
+        )
+
     def on_new_token_hashes(
         self,
         token_ids: list[int],
@@ -258,10 +347,50 @@ class BlendTokenRangeMatcherV3:
             return
 
         with self._lock:
+            # Coverage filter (mirror of the worker's store-side encode skip,
+            # arch/mamba2 _reused_store_chunks): a chunk window fully covered
+            # by ALREADY-REGISTERED content at any alignment adds no new
+            # retrievable coverage — any future query containing this window
+            # contains the covering originals too, and matches them directly.
+            # Indexing it anyway is actively harmful for recurrent-hybrid
+            # stores: the worker skipped its aux encode as covered, so the
+            # registered copy would carry a POISONED aux page — matches
+            # landing on it reject at delivery and shadow the aux-carrying
+            # originals (observed: perf_cb_reuse, 28 rejections, blends
+            # 8/46). Exact-content duplicates are handled separately by
+            # _content_is_live below; this extends the refusal to shifted
+            # windows.
+            covered: list[tuple[int, int]] = []
+            if self._chunk_token_hash and len(arr) >= self.chunk_size:
+                rolling = rolling_hash_windows_numba(arr, self.chunk_size, self._BASE)
+                cids_at_pos = self._table_id[rolling & self._mask]
+                spans: list[tuple[int, int]] = []
+                for pos in np.nonzero(cids_at_pos >= 0)[0]:
+                    pos = int(pos)
+                    cid = int(cids_at_pos[pos])
+                    if int(rolling[pos]) != self._chunk_poly_hash[cid]:
+                        continue  # bucket-only collision
+                    if self._chunk_token_hash[cid] is None:
+                        continue  # evicted
+                    spans.append((pos, pos + self.chunk_size))
+                spans.sort()
+                for lo, hi in spans:
+                    if covered and lo <= covered[-1][1]:
+                        covered[-1] = (covered[-1][0], max(covered[-1][1], hi))
+                    else:
+                        covered.append((lo, hi))
+
+            def _is_covered(i: int) -> bool:
+                c_lo = i * self.chunk_size
+                c_hi = c_lo + self.chunk_size
+                return any(lo <= c_lo and c_hi <= hi for lo, hi in covered)
+
             new_idxs = [
                 i
                 for i in range(start_chunk_idx, n)
                 if token_hashes[i] not in self._token_hash_to_compact_id
+                and not self._content_is_live(int(chunk_hashes[i]))
+                and not _is_covered(i)
             ]
             if not new_idxs:
                 return
@@ -519,6 +648,100 @@ def _cb_group_rope_geometry(
     return fused_packed, per_head, n_heads, 0
 
 
+@dataclass(frozen=True)
+class _CBReadGroups:
+    """CacheBlend's read set over a registration's object groups.
+
+    Attributes:
+        gids: Object groups blend stages and reads, in ascending id order —
+            the attention group and, when present, the standalone fused-aux
+            group. Recurrent-state groups are never included (blend neither
+            reads nor writes position-bound state pages). Every multi-object
+            key list, staging row set, and coverage divisor in this module
+            is ordered chunk-major over exactly these gids.
+        attn_gid: The full-attention object group's id.
+        aux_gid: The standalone fused-aux object group's id, or ``None``
+            when the registration has no aux pool (attention-only models)
+            or the layout is the legacy single fused object group.
+    """
+
+    gids: tuple[int, ...]
+    attn_gid: int
+    aux_gid: int | None
+
+
+def _classify_cb_read_groups(
+    num_object_groups: int, group_kinds: tuple[str, ...]
+) -> _CBReadGroups:
+    """Classify a registration's object groups into CacheBlend's read set.
+
+    Args:
+        num_object_groups: Total object groups in the registration.
+        group_kinds: Per-object-group kind labels from
+            :meth:`KVLayerGroupsManager.get_attn_desc` (``"attention"`` /
+            ``"recurrent"`` / ``"standalone"``); may be empty only for
+            single-group layouts.
+
+    Returns:
+        The read set. A single-object-group layout (the default, fused) maps
+        to group 0 with no separate aux group.
+
+    Raises:
+        RuntimeError: If a multi-group layout has no kind labels, no unique
+            attention group, or more than one standalone group — layouts the
+            CacheBlend v3 read paths cannot address.
+    """
+    if num_object_groups <= 1:
+        return _CBReadGroups(gids=(0,), attn_gid=0, aux_gid=None)
+    if len(group_kinds) != num_object_groups:
+        raise RuntimeError(
+            f"CacheBlend: {num_object_groups} object groups but "
+            f"{len(group_kinds)} kind label(s); cannot resolve the blend "
+            "read set (registration predates group kinds?)."
+        )
+    attn = [i for i, k in enumerate(group_kinds) if k == "attention"]
+    standalone = [i for i, k in enumerate(group_kinds) if k == "standalone"]
+    if len(attn) != 1 or len(standalone) > 1:
+        raise RuntimeError(
+            f"CacheBlend supports exactly one attention object group and at "
+            f"most one standalone (fused-aux) object group; got kinds "
+            f"{group_kinds!r}."
+        )
+    aux_gid = standalone[0] if standalone else None
+    gids = (attn[0],) if aux_gid is None else tuple(sorted((attn[0], aux_gid)))
+    return _CBReadGroups(gids=gids, attn_gid=attn[0], aux_gid=aux_gid)
+
+
+def _cb_chunk_major_object_keys(
+    key: IPCCacheServerKey, chunk_hashes: list[bytes], gids: tuple[int, ...]
+) -> list:
+    """Expand chunk hashes to object keys, chunk-major.
+
+    Ordering: chunk 0's keys for every gid (ascending) and every kv rank,
+    then chunk 1's, and so on — so per-chunk strides are uniform
+    ``len(gids) * expansion`` and prefix bitmaps stay leading-ones-aligned.
+    The per-key rank expansion follows ``ipc_key_to_object_keys`` (1 for a
+    worker-specific key, ``world_size`` for a rank-agnostic lookup key).
+
+    Args:
+        key: The request key.
+        chunk_hashes: One content hash per chunk.
+        gids: Object group ids, ascending (see :class:`_CBReadGroups`).
+
+    Returns:
+        The flattened key list, ``len(chunk_hashes) * len(gids) * expansion``
+        entries.
+    """
+    per_group = ipc_key_to_object_keys(key, chunk_hashes, list(gids))
+    n_hashes = len(chunk_hashes)
+    expansion = len(per_group[0]) // n_hashes if n_hashes else 0
+    out: list = []
+    for i in range(n_hashes):
+        for g in range(len(gids)):
+            out.extend(per_group[g][i * expansion : (i + 1) * expansion])
+    return out
+
+
 class BlendV3Module(InstanceLivenessTarget):
     """Paged-aware V3 CacheBlend. Wraps LMCacheDrivenTransfer STORE to register
     fingerprints; serves CB rope/lookup/retrieve RPCs; reads cross-module
@@ -531,16 +754,12 @@ class BlendV3Module(InstanceLivenessTarget):
         coordinator: "BlendCoordinatorClient | None" = None,
         enable_segmented_prefix: bool = False,
     ):
-        # CacheBlend assumes every chunk lives in one object per rank; a
-        # separated-group layout would silently mismatch its fingerprint and
-        # retrieve paths, so refuse it outright.
-        # TODO(Weishu): support separate object groups in CacheBlend.
-        if ctx.separate_object_groups:
-            raise RuntimeError(
-                "CacheBlend only supports the single-object-group layout; "
-                "run without --separate-object-groups (it is off by default)."
-            )
-
+        # Under --separate-object-groups a chunk's bytes split into one
+        # object per object group. Blend reads exactly the attention group
+        # plus the standalone fused-aux group (recurrent-state groups are
+        # ignored); the read set is resolved per registration via
+        # _classify_cb_read_groups, which rejects layouts the read paths
+        # cannot address (e.g. multiple attention buckets).
         self._ctx = ctx
         self._transfer_module = lmcache_driven_transfer
         # Server config (--enable-segmented-prefix): retain the gapped prefix on
@@ -554,6 +773,12 @@ class BlendV3Module(InstanceLivenessTarget):
         self._event_bus = ctx.event_bus
         self._cb_rope_state: dict[int, _CBRopeState] = {}
 
+        # Opaque per-chunk aux-blob store, keyed by the same fingerprints as
+        # the KV objects: the side plane a recurrent-state hybrid needs to
+        # reuse a chunk (NemotronH mamba2 conv/ssm state, GDN projections).
+        # Fully payload-agnostic; see aux_store.py.
+        self._aux_store = AuxBlobStore(ctx)
+
         # L2 opt: cache TP-expanded obj_keys at lookup, pop at retrieve.
         self._lookup_obj_keys_cache: dict[str, dict[bytes, list]] = {}
         self._lookup_obj_keys_lock = threading.Lock()
@@ -563,7 +788,7 @@ class BlendV3Module(InstanceLivenessTarget):
         # Bounded LRU keyed by (request id, WORKER id) -- at TP>1 each worker
         # issues its own retrieve and scatters into its own KV buffers, so the
         # key must include the worker or later ranks skip work they never did.
-        self._cb_applied_match_ranges: "OrderedDict[tuple[str, int | None], set[tuple[bytes, int, int]]]" = OrderedDict()  # noqa: E501
+        self._cb_applied_match_ranges: "OrderedDict[tuple[str, int | None], set[tuple[bytes, int, int, int]]]" = OrderedDict()  # noqa: E501
 
         # Request-invariant retrieve-plan specs per GPU context (entries die
         # with the context). The cached tuple holds the rope_state it was
@@ -576,11 +801,44 @@ class BlendV3Module(InstanceLivenessTarget):
         self._cb_slot_staging: "weakref.WeakKeyDictionary[Any, tuple]" = (
             weakref.WeakKeyDictionary()
         )
+        # One completion event per context, recorded on the caller's stream
+        # after each retrieve's device work is dispatched. The next retrieve
+        # host-synchronizes it before rewriting the shared slot/temp buffers
+        # (see _build_cb_retrieve_plan_flat for the race and the soundness
+        # argument).
+        self._cb_plan_done_events: "weakref.WeakKeyDictionary[Any, _DeviceEvent]" = (
+            weakref.WeakKeyDictionary()
+        )
+        # Retrieve-owned stream per context. The store path runs its gather
+        # and commit copies on the context's shared stream for seconds after
+        # each request; a retrieve enqueued on that stream executes FIFO
+        # behind them, which just moves the old device-sync wait from the
+        # plan stage into the worker's scatter-complete wait. With staging
+        # memory already private (_resolve_cb_plan_invariants), a private
+        # stream makes the retrieve fully independent of store traffic. The
+        # interprocess completion event the worker waits on is recorded on
+        # this stream, so worker-side ordering is unchanged.
+        self._cb_retrieve_streams: "weakref.WeakKeyDictionary[Any, Any]" = (
+            weakref.WeakKeyDictionary()
+        )
 
         # Non-blocking cb_unified_lookup poll state (submit-once, poll-on-recall)
         # so the handler never holds a worker thread across the L2->L1 loads.
         self._cb_jobs: dict[str, _CBUnifiedJob] = {}
         self._cb_jobs_lock = threading.Lock()
+
+        # Prompt-end state snapshots, keyed by (last-full-chunk chain hash,
+        # worker id) — several tails can share a boundary, hence the list.
+        # LRU-bounded by _CB_SNAPSHOT_CAP_BYTES. ``_cb_snapshot_promises``
+        # pins the entry a CB_UNIFIED_LOOKUP hit promised to a request so an
+        # eviction between lookup and CB_SNAPSHOT_GET cannot strand a worker
+        # that already reported external tokens to its scheduler.
+        self._cb_snapshots: "OrderedDict[tuple[bytes, int], list[_CBSnapshot]]" = (
+            OrderedDict()
+        )
+        self._cb_snapshot_bytes = 0
+        self._cb_snapshot_lock = threading.Lock()
+        self._cb_snapshot_promises: "OrderedDict[str, _CBSnapshot]" = OrderedDict()
 
         # Async fingerprint registration: store enqueues, worker drains.
         _FpJob = tuple[list[int], list[bytes], int, int]
@@ -632,6 +890,22 @@ class BlendV3Module(InstanceLivenessTarget):
             HandlerSpec(
                 RequestType.CB_RETRIEVE_PRE_COMPUTED_V3,
                 self.cb_retrieve_pre_computed,
+                ThreadPoolType.AFFINITY,
+            ),
+            HandlerSpec(RequestType.AUX_PUT, self.store_aux, ThreadPoolType.AFFINITY),
+            HandlerSpec(
+                RequestType.AUX_GET_BY_HASH_IPC,
+                self.retrieve_aux_by_hashes_ipc,
+                ThreadPoolType.AFFINITY,
+            ),
+            HandlerSpec(
+                RequestType.CB_SNAPSHOT_PUT,
+                self.cb_snapshot_put,
+                ThreadPoolType.AFFINITY,
+            ),
+            HandlerSpec(
+                RequestType.CB_SNAPSHOT_GET,
+                self.cb_snapshot_get,
                 ThreadPoolType.AFFINITY,
             ),
         ]
@@ -701,10 +975,10 @@ class BlendV3Module(InstanceLivenessTarget):
                 legacy inference and would get its content dims rotated.
 
         Raises:
-            ValueError: If ``instance_id`` has no registered KV cache, the
-                cache list is empty, ``group_to_cache`` references a missing
-                cache or does not cover every engine group of the registered
-                model, or a ``group_rot`` entry is malformed.
+            ValueError: If ``instance_id`` has no registered KV cache,
+                ``group_to_cache`` references a missing cache or does not
+                cover every engine group of the registered model, or a
+                ``group_rot`` entry is malformed.
         """
         entry = self._transfer_module.get_and_touch_context_entry(instance_id)
         if entry is None:
@@ -712,8 +986,9 @@ class BlendV3Module(InstanceLivenessTarget):
                 f"Instance {instance_id} has no paged KV cache registered; "
                 "send REGISTER_KV_CACHE before CB_REGISTER_ROPE_V3."
             )
-        if not cos_sin_caches_ipc:
-            raise ValueError("CB_REGISTER_ROPE_V3 requires >=1 cos/sin cache.")
+        # Zero caches is legal: a NoPE model (NemotronH) applies no rotary at
+        # all. The rope state is still registered — it carries the head layout
+        # the scatter geometry needs — and every re-RoPE consumer skips.
         if group_to_cache:
             if min(group_to_cache) < 0 or max(group_to_cache) >= len(
                 cos_sin_caches_ipc
@@ -790,7 +1065,7 @@ class BlendV3Module(InstanceLivenessTarget):
             instance_id,
             len(cos_sin_caches),
             [tuple(c.shape) for c in cos_sin_caches],
-            cos_sin_caches[0].dtype,
+            cos_sin_caches[0].dtype if cos_sin_caches else "n/a (NoPE)",
             head_size,
             is_neox_style,
             "uniform" if not group_to_cache else str(group_to_cache),
@@ -934,10 +1209,41 @@ class BlendV3Module(InstanceLivenessTarget):
         """
         return self._ctx.layout_desc_registry.find(model_name, world_size)
 
+    def _resolve_cb_read_layouts(
+        self, model_name: str, world_size: int
+    ) -> "tuple[_CBReadGroups, dict[int, MemoryLayoutDesc], AttnWindowDesc] | None":
+        """Resolve blend's read set and layouts for ``(model_name, world_size)``.
+
+        Args:
+            model_name (str): Model name to match.
+            world_size (int): Tensor-parallel world size to match.
+
+        Returns:
+            ``(read_groups, group_layout_descs, attn_desc)`` — the blend read
+            set (see :class:`_CBReadGroups`), every object group's layout
+            (the prefetch spec validator requires exact coverage), and the
+            registration's window descriptor — or ``None`` when no registered
+            CB context matches.
+
+        Raises:
+            RuntimeError: If the registered multi-group layout has no
+                resolvable blend read set (see
+                :func:`_classify_cb_read_groups`).
+        """
+        registry = self._ctx.layout_desc_registry
+        layouts = registry.find_group_layout_descs(model_name, world_size)
+        if not layouts:
+            return None
+        attn_desc = registry.find_attn_desc(model_name, world_size)
+        read = _classify_cb_read_groups(
+            attn_desc.num_object_groups, attn_desc.group_kinds
+        )
+        return read, layouts, attn_desc
+
     def _sparse_prefetch_submit(
         self,
         key: IPCCacheServerKey,
-        layout_desc: "MemoryLayoutDesc",
+        resolved: "tuple[_CBReadGroups, dict[int, MemoryLayoutDesc], AttnWindowDesc]",
         matches: list[CBMatchResult],
     ) -> "tuple[PrefetchHandle, dict[bytes, list], list[int]]":
         """Coalesce all matches into one sparse L2->L1 prefetch and submit it.
@@ -949,21 +1255,24 @@ class BlendV3Module(InstanceLivenessTarget):
 
         Args:
             key (IPCCacheServerKey): The request key.
-            layout_desc (MemoryLayoutDesc): CB KV buffer layout for L1 alloc.
+            resolved: The read set + layouts from
+                :meth:`_resolve_cb_read_layouts`.
             matches (list[CBMatchResult]): Non-prefix matches to prefetch.
 
         Returns:
             tuple[PrefetchHandle, dict[bytes, list], list[int]]: the prefetch
-            handle, per-hash TP-expanded object keys, and each expanded
-            position's deduped-key index (maps the per-key found set back to
-            every chunk).
+            handle, per-hash object keys (chunk-major: every read group's
+            rank-expanded keys for that hash, group-major within the hash),
+            and each expanded position's deduped-key index (maps the per-key
+            found set back to every chunk).
         """
-        world_size = key.world_size
+        read, layouts, attn_desc = resolved
         per_hash_obj_keys: dict[bytes, list] = {}
         all_hashes = [r.hash for r in matches]
-        all_obj_keys = ipc_key_to_object_keys(key, all_hashes, [0])[0]
+        all_obj_keys = _cb_chunk_major_object_keys(key, all_hashes, read.gids)
+        per_chunk = len(all_obj_keys) // len(all_hashes) if all_hashes else 0
         for i, h in enumerate(all_hashes):
-            per_hash_obj_keys[h] = all_obj_keys[i * world_size : (i + 1) * world_size]
+            per_hash_obj_keys[h] = all_obj_keys[i * per_chunk : (i + 1) * per_chunk]
 
         # Dedup keys before submit (sparse keeps one read lock per loaded key;
         # a duplicate would leak). Map each expanded position to its deduped
@@ -982,12 +1291,9 @@ class BlendV3Module(InstanceLivenessTarget):
         handle: PrefetchHandle = self._ctx.storage_manager.submit_prefetch_task(
             PrefetchRequestSpec(
                 keys=uniq_keys,
-                # TODO(Weishu): cacheblend assumes the single-object-group
-                # layout (enforced at server startup by requiring
-                # --no-separate-object-groups); support separate object
-                # groups here.
-                group_layout_descs={0: layout_desc},
+                group_layout_descs=layouts,
                 policy=TrimPolicy.SPARSE,
+                attn_desc=attn_desc,
             ),
             external_request_id=key.request_id,
         )
@@ -1017,12 +1323,16 @@ class BlendV3Module(InstanceLivenessTarget):
         Returns:
             list[CBMatchResult]: The found subset, in cur_st order.
         """
-        world_size = key.world_size
+        # Per-chunk key stride: every read group's rank-expanded keys (a
+        # chunk is found only when ALL of them loaded — an attention object
+        # without its aux object would blend and then fail worker-side
+        # validation mid-forward).
+        per_chunk = len(expanded_uidx) // len(matches) if matches else 0
         found_cb_match_result: list[CBMatchResult] = []
         stale_hashes: list[bytes] = []
         for j, r in enumerate(matches):
-            base = j * world_size
-            if all(expanded_uidx[base + t] in found_uidx for t in range(world_size)):
+            base = j * per_chunk
+            if all(expanded_uidx[base + t] in found_uidx for t in range(per_chunk)):
                 found_cb_match_result.append(r)
             else:
                 stale_hashes.append(r.hash)
@@ -1081,7 +1391,7 @@ class BlendV3Module(InstanceLivenessTarget):
         key: IPCCacheServerKey,
         tp_size: int,
         policy: TrimPolicy,
-    ) -> "tuple[PrefetchHandle | None, int]":
+    ) -> "tuple[PrefetchHandle | None, int, int]":
         """Submit the CB prefix prefetch (non-blocking).
 
         Opens the ``cb.prefix_lookup`` span (CB namespace — CB requests no longer
@@ -1098,8 +1408,10 @@ class BlendV3Module(InstanceLivenessTarget):
             policy (TrimPolicy): ``PREFIX`` or ``SEGMENTED_PREFIX``.
 
         Returns:
-            tuple: ``(handle, world_size)``. ``handle`` is None when there is no
-            GPU context or no full chunk (the poll then reports 0 coverage).
+            tuple: ``(handle, world_size, read_groups)`` — ``read_groups`` is
+            the number of object groups each chunk's keys cover. ``handle``
+            is None when there is no GPU context or no full chunk (the poll
+            then reports 0 coverage).
         """
         rid = key.request_id
         model_name, world_size = key.model_name, key.world_size
@@ -1107,18 +1419,20 @@ class BlendV3Module(InstanceLivenessTarget):
             Event(event_type=EventType.CB_PREFIX_LOOKUP_START, session_id=rid)
         )
 
-        layout_desc = self._resolve_cb_layout_desc(model_name, world_size)
-        if layout_desc is None:
+        resolved = self._resolve_cb_read_layouts(model_name, world_size)
+        if resolved is None:
             logger.error(
                 "No CB GPU context for model %s ws %d during prefix lookup!",
                 model_name,
                 world_size,
             )
-            return None, world_size
+            return None, world_size, 1
+        read, layouts, attn_desc = resolved
+        layout_desc = layouts[read.attn_gid]
 
         chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(list(key.token_ids))
         if not chunk_hashes:
-            return None, world_size
+            return None, world_size, 1
 
         # Lookup-hash logger (chunk hashes, for debug); guarded so the metadata
         # dict is built only when a subscriber is listening.
@@ -1146,17 +1460,21 @@ class BlendV3Module(InstanceLivenessTarget):
         session.lookup_ipc_key = key
 
         extra_count = compute_extra_count(tp_size, world_size)
-        obj_keys = ipc_key_to_object_keys(key, chunk_hashes, [0])[0]
+        # Chunk-major over the read groups so count_leading_ones() stays
+        # prefix-aligned (a chunk's keys — every group, every rank — are
+        # contiguous; the divisor in _poll_prefix_leg matches).
+        obj_keys = _cb_chunk_major_object_keys(key, chunk_hashes, read.gids)
         handle = self._ctx.storage_manager.submit_prefetch_task(
             PrefetchRequestSpec(
                 keys=obj_keys,
-                group_layout_descs={0: layout_desc},
+                group_layout_descs=layouts,
                 extra_count=extra_count,
                 policy=policy,
+                attn_desc=attn_desc,
             ),
             external_request_id=rid,
         )
-        return handle, world_size
+        return handle, world_size, len(read.gids)
 
     def _poll_prefix_leg(
         self, job: "_CBUnifiedJob", rid: str, segmented: bool
@@ -1183,18 +1501,20 @@ class BlendV3Module(InstanceLivenessTarget):
             bm = self._ctx.storage_manager.query_prefetch_status(job.prefix_handle)
             if bm is None:
                 return None  # still loading
-            ws = job.prefix_world_size
+            # Keys are chunk-major: every read group's rank shards for one
+            # chunk are contiguous, so the per-chunk stride is ws * groups.
+            per_chunk = job.prefix_world_size * job.prefix_read_groups
             # NOTE(Kuntai): assumes uniform world size and prefix-ordered keys
             # that break at the first miss.
-            leading = bm.count_leading_ones() // ws
-            # Retain a chunk only if EVERY rank shard loaded (AND across the ws
-            # shards); a chunk missing any rank's shard is demoted to a gap.
+            leading = bm.count_leading_ones() // per_chunk
+            # Retain a chunk only if EVERY key loaded (AND across the rank
+            # shards of every read group); a chunk missing any is a gap.
             if segmented:
                 shard_counts: dict[int, int] = {}
                 for ki in bm.get_indices_list():
-                    c = ki // ws
+                    c = ki // per_chunk
                     shard_counts[c] = shard_counts.get(c, 0) + 1
-                retained = sorted(c for c, n in shard_counts.items() if n == ws)
+                retained = sorted(c for c, n in shard_counts.items() if n == per_chunk)
             else:
                 retained = None
         else:
@@ -1247,64 +1567,114 @@ class BlendV3Module(InstanceLivenessTarget):
                     metadata={"num_tokens": len(key.token_ids)},
                 )
             )
-            # SEGMENTED_PREFIX: request the contiguous prefix with gap-tolerant
-            # retention so a mid-prefix L2 retrieve failure leaves the post-gap
-            # chunks L1-resident (picked up by the sparse leg as L1 hits, hole
-            # recomputed) instead of truncating the prefix at the gap.
-            prefix_policy = (
-                TrimPolicy.SEGMENTED_PREFIX
-                if self._segmented_prefix
-                else TrimPolicy.PREFIX
-            )
-            # Prefix leg: blend_v3 owns the submit + the cb.prefix_lookup span
-            # (under cb.lookup); prefix hit tokens land on the CB hit-rate
-            # metric via CB_LOOKUP_END below.
-            prefix_handle, prefix_ws = self._submit_prefix_leg(
-                key, tp_size, prefix_policy
-            )
-            # Local and coordinator matching are mutually exclusive: with a
-            # coordinator the fleet directory is the only source, so skip the
-            # local matcher (and its span). The coordinator leg is async
-            # (submitted below, resolved at poll) and is timed by cb.lookup.
-            matches: list[CBMatchResult]
-            if self._coordinator is not None:
-                matches = []
-            else:
-                # Local fingerprint match: CPU-bound, tight span.
-                self._event_bus.publish(
-                    Event(
-                        event_type=EventType.CB_FINGERPRINT_MATCH_START,
-                        session_id=rid,
-                    )
+            # Prompt-end snapshot hit: skip the prefix leg and the
+            # fingerprint matcher, but ride the NORMAL sparse-prefetch flow
+            # with the covered chunks synthesized as delta-0 matches — the
+            # worker's synchronous CB retrieve requires them prefetched and
+            # pinned exactly like blend matches (one deferred poll, ~20 ms,
+            # vs the ~800 ms WAITING_FOR_REMOTE_KVS round-trip of the
+            # deferred parent leg). Local-matcher deployments only; with a
+            # fleet coordinator the poll would wait on its match leg.
+            snap_hit: "tuple[int, list[int], list[bytes]] | None" = None
+            if self._coordinator is None:
+                snap_tokens, snap_sizes, snap_hashes = self._snapshot_lookup(
+                    list(key.token_ids), int(key.worker_id or 0), rid
                 )
-                matches = self._match_fingerprints(key)
-                self._event_bus.publish(
-                    Event(
-                        event_type=EventType.CB_FINGERPRINT_MATCH_END,
-                        session_id=rid,
-                        metadata={"matches": len(matches)},
+                if snap_tokens > 0:
+                    snap_hit = (snap_tokens, snap_sizes, snap_hashes)
+                    logger.info(
+                        "CB snapshot: lookup hit for req=%s covered=%d (%d chunk(s))",
+                        rid,
+                        snap_tokens,
+                        len(snap_hashes),
                     )
-                )
-            job = _CBUnifiedJob(
-                matches=matches,
-                num_tokens=len(key.token_ids),
-                prefix_handle=prefix_handle,
-                prefix_world_size=prefix_ws,
-            )
-            job.coord_submitted = self._submit_coordinator_match(key)
-            if job.coord_submitted and self._coordinator is not None:
-                job.coord_deadline = time.monotonic() + self._coordinator.match_budget_s
-                # Coordinator match leg: async span, ended on the resolving poll
-                # (or deadline) in _poll_coordinator_match.
-                self._event_bus.publish(
-                    Event(
-                        event_type=EventType.CB_COORDINATOR_MATCH_START,
-                        session_id=rid,
+                    job = _CBUnifiedJob(
+                        matches=[
+                            CBMatchResult(
+                                old_st=i * chunk_size,
+                                old_ed=(i + 1) * chunk_size,
+                                cur_st=i * chunk_size,
+                                cur_ed=(i + 1) * chunk_size,
+                                hash=h,
+                            )
+                            for i, h in enumerate(snap_hashes)
+                        ],
+                        num_tokens=len(key.token_ids),
+                        prefix_handle=None,
+                        prefix_world_size=tp_size,
                     )
-                )
-            with self._cb_jobs_lock:
-                self._cb_jobs[rid] = job
+                    job.prefix_chunks = 0  # prefix leg skipped
+                    job.snapshot = snap_hit
+                    with self._cb_jobs_lock:
+                        self._cb_jobs[rid] = job
 
+            if snap_hit is None:
+                # SEGMENTED_PREFIX: request the contiguous prefix with
+                # gap-tolerant retention so a mid-prefix L2 retrieve failure
+                # leaves the post-gap chunks L1-resident (picked up by the
+                # sparse leg as L1 hits, hole recomputed) instead of
+                # truncating the prefix at the gap.
+                prefix_policy = (
+                    TrimPolicy.SEGMENTED_PREFIX
+                    if self._segmented_prefix
+                    else TrimPolicy.PREFIX
+                )
+                # Prefix leg: blend_v3 owns the submit + the cb.prefix_lookup
+                # span (under cb.lookup); prefix hit tokens land on the CB
+                # hit-rate metric via CB_LOOKUP_END below.
+                prefix_handle, prefix_ws, prefix_groups = self._submit_prefix_leg(
+                    key, tp_size, prefix_policy
+                )
+                # Local and coordinator matching are mutually exclusive: with
+                # a coordinator the fleet directory is the only source, so
+                # skip the local matcher (and its span). The coordinator leg
+                # is async (submitted below, resolved at poll) and is timed
+                # by cb.lookup.
+                matches: list[CBMatchResult]
+                if self._coordinator is not None:
+                    matches = []
+                else:
+                    # Local fingerprint match: CPU-bound, tight span.
+                    self._event_bus.publish(
+                        Event(
+                            event_type=EventType.CB_FINGERPRINT_MATCH_START,
+                            session_id=rid,
+                        )
+                    )
+                    matches = self._match_fingerprints(key)
+                    self._event_bus.publish(
+                        Event(
+                            event_type=EventType.CB_FINGERPRINT_MATCH_END,
+                            session_id=rid,
+                            metadata={"matches": len(matches)},
+                        )
+                    )
+                job = _CBUnifiedJob(
+                    matches=matches,
+                    num_tokens=len(key.token_ids),
+                    prefix_handle=prefix_handle,
+                    prefix_world_size=prefix_ws,
+                    prefix_read_groups=prefix_groups,
+                )
+                job.coord_submitted = self._submit_coordinator_match(key)
+                if job.coord_submitted and self._coordinator is not None:
+                    job.coord_deadline = (
+                        time.monotonic() + self._coordinator.match_budget_s
+                    )
+                    # Coordinator match leg: async span, ended on the
+                    # resolving poll (or deadline) in _poll_coordinator_match.
+                    self._event_bus.publish(
+                        Event(
+                            event_type=EventType.CB_COORDINATOR_MATCH_START,
+                            session_id=rid,
+                        )
+                    )
+                with self._cb_jobs_lock:
+                    self._cb_jobs[rid] = job
+
+        # Both first-invocation branches above assign the job; mypy cannot
+        # see through the nested conditionals.
+        assert job is not None
         segmented = self._segmented_prefix
 
         # --- Prefix leg: poll (consume-once) until the L1+L2 prefix lands. ---
@@ -1344,19 +1714,21 @@ class BlendV3Module(InstanceLivenessTarget):
                     for c in candidates
                     if c.old_st != c.cur_st or (c.cur_st // chunk_size) not in retained
                 ]
-            job.non_prefix = self._non_overlapping_after_prefix(
-                candidates, prefix_tokens
-            )
+            # Prefix-filter only — the overlap dedup runs AFTER the prefetch
+            # (see the classify site below). Two generations of the same content
+            # match at different offsets and overlap, so deduping here picks a
+            # winner blind to whether its object can actually be fetched; when
+            # that guess is wrong the whole request loses CB even though a
+            # perfectly good alternative was in hand.
+            job.non_prefix = [c for c in candidates if c.cur_st >= prefix_tokens]
             if job.non_prefix:
-                layout_desc = self._resolve_cb_layout_desc(
-                    key.model_name, key.world_size
-                )
-                if layout_desc is not None:
+                resolved = self._resolve_cb_read_layouts(key.model_name, key.world_size)
+                if resolved is not None:
                     (
                         job.handle,
                         job.per_hash_obj_keys,
                         job.expanded_uidx,
-                    ) = self._sparse_prefetch_submit(key, layout_desc, job.non_prefix)
+                    ) = self._sparse_prefetch_submit(key, resolved, job.non_prefix)
                     # Only trace the span when the prefetch actually reads L2;
                     # all-L1-resident matches do no L2 work worth a span.
                     job.l2_keys = len(job.handle.l2_orig_indices)
@@ -1402,13 +1774,28 @@ class BlendV3Module(InstanceLivenessTarget):
 
         # --- BOTH legs ready: classify the complement + finalize. ---
         if job.handle is not None:
-            found = self._sparse_classify(
+            fetched = self._sparse_classify(
                 key,
                 job.non_prefix or [],
                 job.found_uidx or set(),
                 job.per_hash_obj_keys or {},
                 job.expanded_uidx or [],
             )
+            # Overlap dedup over the RETRIEVABLE candidates: two matches across
+            # the same request range cannot both scatter, and now the loser is
+            # chosen among chunks we know we can serve. Keys loaded for the
+            # candidates dropped here are released by the retrieve path's orphan
+            # sweep (they stay in the lookup obj-key cache).
+            found = self._non_overlapping_after_prefix(
+                fetched, prefix_chunks * chunk_size
+            )
+            if len(found) != len(fetched):
+                logger.debug(
+                    "CB kept %d of %d retrievable matches after overlap dedup (req=%s)",
+                    len(found),
+                    len(fetched),
+                    rid,
+                )
         else:
             found = []
 
@@ -1465,10 +1852,14 @@ class BlendV3Module(InstanceLivenessTarget):
         )
         with self._cb_jobs_lock:
             self._cb_jobs.pop(rid, None)
+        snap = job.snapshot or (0, [], [])
         return CBUnifiedLookupResult(
             prefix_coverage_tokens=prefix_tokens,
             non_prefix_segments=found,
             segmented_prefix_segments=segmented_tail,
+            snapshot_tokens=snap[0],
+            snapshot_sizes=list(snap[1]),
+            snapshot_chunk_hashes=list(snap[2]),
         )
 
     def store(
@@ -1509,6 +1900,16 @@ class BlendV3Module(InstanceLivenessTarget):
         # not-yet-committed and drop the whole group as stale.
         try:
             session = self._ctx.session_manager.get_or_create(key.request_id)
+            # The request may have FINISHED between the store's key resolve
+            # and this read: request-end cleanup deletes the session, and
+            # get_or_create then returns a FRESH one with no tokens, whose
+            # hash chain is deterministic garbage (chunks of the empty
+            # slice). Those garbage hashes bound to real content windows are
+            # exactly issue #68: every first-generation match derived object
+            # keys that were never stored. Re-set the tokens from the key —
+            # idempotent when the session survived, corrective when it was
+            # recreated.
+            session.set_tokens(list(key.token_ids))
             chunk_hashes = [
                 TokenHasher.hash_to_bytes(h)
                 for h in session.get_hashes(key.start, key.end)
@@ -1516,7 +1917,13 @@ class BlendV3Module(InstanceLivenessTarget):
             if not chunk_hashes:
                 return result
             tokens_in_range = list(key.token_ids)[key.start : key.end]
-            start_chunk_idx = 1 if key.start == 0 else 0
+            # Chunk 0 is skipped because the prefix lookup leg owns it: that
+            # leg always matches from position 0, so a content fingerprint for
+            # chunk 0 would be redundant. (For prefix-leg-disabled hybrids
+            # chunk 0 is then owned by nobody and its first chunk recomputes;
+            # indexing it was measured a net loss until the store-side chunk
+            # skip understands shifted matches — revisit with that work.)
+            start_chunk_idx = 0 if key.start != 0 else 1
             job = (tokens_in_range, chunk_hashes, start_chunk_idx, key.start)
             with self._pending_fp_lock:
                 self._pending_fp_hashes.update(chunk_hashes[start_chunk_idx:])
@@ -1536,6 +1943,295 @@ class BlendV3Module(InstanceLivenessTarget):
             )
 
         return result
+
+    def store_aux(
+        self,
+        key: IPCCacheServerKey,
+        group: int,
+        sizes: list[int],
+        blob_ipc: DeviceIPCWrapper,
+    ) -> bool:
+        """AUX_PUT handler: store the caller's per-chunk blobs (see AuxBlobStore).
+
+        Args:
+            key (IPCCacheServerKey): Store key for the range being cached.
+            group (int): Object-group id for this aux stream.
+            sizes (list[int]): Per-chunk blob byte lengths (chunk order).
+            blob_ipc (DeviceIPCWrapper): IPC handle to the concatenated
+                per-chunk blob payload.
+
+        Returns:
+            bool: Result of :meth:`AuxBlobStore.store`.
+        """
+        blob = blob_ipc.to_tensor().reshape(-1).view(torch.uint8)
+        return self._aux_store.store(key, group, sizes, blob)
+
+    def retrieve_aux_by_hashes_ipc(
+        self,
+        key: IPCCacheServerKey,
+        group: int,
+        chunk_hashes: list[bytes],
+        sizes: list[int],
+        dst_ipc: DeviceIPCWrapper,
+        instance_id: int,
+        event_ipc_handle: bytes,
+    ) -> tuple[bytes, bool]:
+        """AUX_GET_BY_HASH_IPC handler: copy matched chunks straight into the
+        worker's IPC-mapped GPU receive buffer (no D2H / ZMQ bytes / H2D),
+        gated by CUDA IPC events. Mirrors :meth:`cb_retrieve_pre_computed`.
+
+        Maps the worker buffer (``dst_ipc.to_tensor``), orders the copies after
+        the worker's forward (waits ``event_ipc_handle`` on the instance's
+        stream), copies each prefetched L1 chunk into ``dst`` on that stream,
+        and records a completion event the worker waits on. The data never
+        leaves the (shared) GPU.
+
+        Args:
+            key (IPCCacheServerKey): Carries model/world_size/worker_id/salt.
+            group (int): Object-group id for this aux stream.
+            chunk_hashes (list[bytes]): Stored per-chunk hashes, one per chunk.
+            sizes (list[int]): Per-chunk blob byte lengths (aligned to hashes).
+            dst_ipc (DeviceIPCWrapper): IPC handle of the worker's GPU receive
+                buffer (>= ``sum(sizes)`` bytes, uint8).
+            instance_id (int): Registered KV-cache instance (for the GPU
+                context's device + stream).
+            event_ipc_handle (bytes): The worker's forward-fence CUDA event.
+
+        Returns:
+            tuple[bytes, bool]: ``(completion_event_ipc_handle, ok)`` — ``ok``
+            is ``False`` on a miss/size-mismatch so the worker recomputes.
+
+        Raises:
+            ValueError: If ``instance_id`` has no registered KV cache.
+        """
+        entry = self._transfer_module.get_and_touch_context_entry(instance_id)
+        if entry is None:
+            raise ValueError(
+                f"Instance {instance_id} not registered for paged KV cache"
+            )
+        gpu_context = entry.cache_context
+        obj_keys = ipc_key_to_object_keys(key, list(chunk_hashes), [group])[0]
+        with (
+            torch_dev.device(gpu_context.device),
+            torch_dev.stream(gpu_context.stream),
+        ):
+            check_interprocess_event_support()
+            event = torch_dev.Event(interprocess=True)
+            # Map the worker's receive buffer into this process (same physical
+            # GPU -> zero-copy view), exactly as store_aux maps the PUT blob.
+            dst = dst_ipc.to_tensor().reshape(-1).view(torch.uint8)
+            # Order the copies AFTER the worker's outstanding forward work.
+            if hasattr(torch_dev.Event, "from_ipc_handle"):
+                vllm_event = torch_dev.Event.from_ipc_handle(
+                    gpu_context.device, event_ipc_handle
+                )
+                vllm_event.wait(stream=gpu_context.stream)
+            ok = self._aux_store.fetch_into_ipc(obj_keys, sizes, dst)
+            event.record()
+        return event.ipc_handle(), ok
+
+    def cb_snapshot_put(
+        self,
+        key: IPCCacheServerKey,
+        sizes: list[int],
+        blob_ipc: DeviceIPCWrapper,
+        instance_id: int,
+        event_ipc_handle: bytes,
+    ) -> bool:
+        """CB_SNAPSHOT_PUT handler: persist a prompt-end state snapshot.
+
+        Maps the worker's GPU staging buffer, orders the copy after the
+        worker's capture (waits its CUDA event), copies the blob to host,
+        and registers it under (last-full-chunk chain hash, worker id) with
+        the prompt's unaligned tail tokens for exact-extension matching.
+
+        Args:
+            key: Carries the FULL prompt token ids (start/end unused) plus
+                request id / worker id.
+            sizes: Opaque blob section byte lengths (sum = payload bytes).
+            blob_ipc: IPC handle of the worker's packed snapshot buffer.
+            instance_id: Registered KV-cache instance (device + stream).
+            event_ipc_handle: Worker-side CUDA event fencing the capture.
+
+        Returns:
+            True when stored; False on a sub-chunk prompt, an unknown
+            instance, or a size mismatch (the caller loses nothing — the
+            next identical prompt simply finds no snapshot).
+        """
+        tokens = list(key.token_ids)
+        chunk = self._ctx.chunk_size
+        n_chunks = len(tokens) // chunk
+        total = sum(int(s) for s in sizes)
+        if n_chunks <= 0 or total <= 0:
+            return False
+        entry = self._transfer_module.get_and_touch_context_entry(instance_id)
+        if entry is None:
+            return False
+        gpu_context = entry.cache_context
+        with (
+            torch_dev.device(gpu_context.device),
+            torch_dev.stream(gpu_context.stream),
+        ):
+            src = blob_ipc.to_tensor().reshape(-1).view(torch.uint8)
+            if int(src.numel()) < total:
+                return False
+            if hasattr(torch_dev.Event, "from_ipc_handle"):
+                fence = torch_dev.Event.from_ipc_handle(
+                    gpu_context.device, event_ipc_handle
+                )
+                fence.wait(stream=gpu_context.stream)
+            host = torch.empty(total, dtype=torch.uint8)
+            host.copy_(src.narrow(0, 0, total), non_blocking=True)
+            torch_dev.current_stream().synchronize()
+
+        boundary = n_chunks * chunk
+        boundary_hash = self._ctx.token_hasher.compute_chunk_hashes(
+            tokens, end=boundary
+        )[-1]
+        snap = _CBSnapshot(
+            covered_tokens=len(tokens),
+            tail_tokens=tuple(tokens[boundary:]),
+            sizes=[int(s) for s in sizes],
+            blob=host,
+        )
+        worker = int(key.worker_id or 0)
+        with self._cb_snapshot_lock:
+            bucket = self._cb_snapshots.setdefault((boundary_hash, worker), [])
+            # Same prompt re-stored: replace in place (state is deterministic
+            # under greedy prefill; the newer capture wins).
+            for i, old in enumerate(bucket):
+                if old.tail_tokens == snap.tail_tokens:
+                    self._cb_snapshot_bytes -= int(old.blob.numel())
+                    bucket[i] = snap
+                    break
+            else:
+                bucket.append(snap)
+            self._cb_snapshot_bytes += total
+            self._cb_snapshots.move_to_end((boundary_hash, worker))
+            while (
+                self._cb_snapshot_bytes > _CB_SNAPSHOT_CAP_BYTES
+                and len(self._cb_snapshots) > 1
+            ):
+                _, evicted = self._cb_snapshots.popitem(last=False)
+                self._cb_snapshot_bytes -= sum(int(e.blob.numel()) for e in evicted)
+        logger.info(
+            "CB snapshot stored: req=%s tokens=%d (%d chunk(s) + %d tail) "
+            "bytes=%d (registry %.1f MiB)",
+            key.request_id,
+            len(tokens),
+            n_chunks,
+            len(tokens) - boundary,
+            total,
+            self._cb_snapshot_bytes / 2**20,
+        )
+        return True
+
+    def _snapshot_lookup(
+        self, token_ids: list[int], worker_id: int, request_id: str
+    ) -> tuple[int, list[int], list[bytes]]:
+        """Longest stored prompt that is a STRICT prefix of ``token_ids``.
+
+        Walks the query's chunk boundaries from the longest down, matching
+        each boundary's chain hash against the registry and verifying the
+        stored tail verbatim. A hit is pinned under ``request_id`` so the
+        follow-up CB_SNAPSHOT_GET cannot lose it to LRU eviction.
+
+        Args:
+            token_ids: The query prompt's token ids.
+            worker_id: TP worker the state was captured on.
+            request_id: Pins the matched entry for the fetch.
+
+        Returns:
+            ``(covered_tokens, sizes, chunk_hashes)`` of the hit — the chain
+            hashes cover the whole chunks up to the hit's boundary, for the
+            worker's hash-addressed KV retrieve — or ``(0, [], [])``.
+        """
+        chunk = self._ctx.chunk_size
+        n = len(token_ids)
+        n_chunks = n // chunk
+        if n_chunks <= 0 or not self._cb_snapshots:
+            return 0, [], []
+        hashes = self._ctx.token_hasher.compute_chunk_hashes(
+            list(token_ids), end=n_chunks * chunk
+        )
+        with self._cb_snapshot_lock:
+            for b in range(n_chunks, 0, -1):
+                bucket = self._cb_snapshots.get((hashes[b - 1], worker_id))
+                if not bucket:
+                    continue
+                boundary = b * chunk
+                for snap in bucket:
+                    # Strict extension only: an exact repeat has no suffix
+                    # row to forward, and its last row is already inside the
+                    # stored state.
+                    if snap.covered_tokens >= n:
+                        continue
+                    tail = snap.tail_tokens
+                    if tuple(token_ids[boundary : boundary + len(tail)]) != tail:
+                        continue
+                    self._cb_snapshots.move_to_end((hashes[b - 1], worker_id))
+                    self._cb_snapshot_promises[request_id] = snap
+                    while len(self._cb_snapshot_promises) > 256:
+                        self._cb_snapshot_promises.popitem(last=False)
+                    return snap.covered_tokens, list(snap.sizes), list(hashes[:b])
+        return 0, [], []
+
+    def cb_snapshot_get(
+        self,
+        key: IPCCacheServerKey,
+        dst_ipc: DeviceIPCWrapper,
+        instance_id: int,
+        event_ipc_handle: bytes,
+    ) -> tuple[bytes, bool]:
+        """CB_SNAPSHOT_GET handler: deliver a promised snapshot blob.
+
+        Pops the entry pinned by this request's CB_UNIFIED_LOOKUP hit (falls
+        back to a fresh lookup) and copies it into the worker-exported GPU
+        buffer on the instance stream, after the worker's fence event.
+
+        Args:
+            key: Same request id + token ids as the promising lookup.
+            dst_ipc: Worker receive buffer (>= blob bytes, uint8).
+            instance_id: Registered KV-cache instance.
+            event_ipc_handle: Worker-side fence event.
+
+        Returns:
+            ``(completion_event_ipc_handle, ok)`` — ``ok`` False when the
+            entry is gone or the buffer is short; the worker then degrades.
+        """
+        rid = key.request_id
+        with self._cb_snapshot_lock:
+            snap = self._cb_snapshot_promises.pop(rid, None)
+        if snap is None:
+            covered, _, _ = self._snapshot_lookup(
+                list(key.token_ids), int(key.worker_id or 0), rid
+            )
+            with self._cb_snapshot_lock:
+                snap = self._cb_snapshot_promises.pop(rid, None)
+            if covered <= 0 or snap is None:
+                return b"", False
+        entry = self._transfer_module.get_and_touch_context_entry(instance_id)
+        if entry is None:
+            return b"", False
+        gpu_context = entry.cache_context
+        total = int(snap.blob.numel())
+        with (
+            torch_dev.device(gpu_context.device),
+            torch_dev.stream(gpu_context.stream),
+        ):
+            check_interprocess_event_support()
+            done = torch_dev.Event(interprocess=True)
+            dst = dst_ipc.to_tensor().reshape(-1).view(torch.uint8)
+            if int(dst.numel()) < total:
+                return b"", False
+            if hasattr(torch_dev.Event, "from_ipc_handle"):
+                fence = torch_dev.Event.from_ipc_handle(
+                    gpu_context.device, event_ipc_handle
+                )
+                fence.wait(stream=gpu_context.stream)
+            dst.narrow(0, 0, total).copy_(snap.blob, non_blocking=True)
+            done.record()
+        return done.ipc_handle(), True
 
     def _submit_coordinator_match(self, key: IPCCacheServerKey) -> bool:
         """Issue a fleet directory match query for this request (best-effort).
@@ -1666,12 +2362,44 @@ class BlendV3Module(InstanceLivenessTarget):
                         chunk_hashes[start_chunk_idx:]
                     )
 
+    def _cb_staged_groups(
+        self, gpu_context: BaseCacheContext
+    ) -> "tuple[_CBReadGroups, list[int]]":
+        """Resolve the blend read set and staged kernel groups for a context.
+
+        Args:
+            gpu_context: The instance's registered cache context.
+
+        Returns:
+            ``(read_groups, staged_kernel_indices)`` — the read set over the
+            context's object groups and the kernel-group indices blend
+            stages/reads, in read-group order (the attention group's kernel
+            groups, then the aux group's). For the legacy single-object-group
+            layout this is every kernel group in registration order.
+
+        Raises:
+            RuntimeError: If the layout has no resolvable blend read set
+                (see :func:`_classify_cb_read_groups`).
+        """
+        kgm = gpu_context.kv_layer_groups_manager
+        attn_desc = kgm.get_attn_desc()
+        read = _classify_cb_read_groups(
+            attn_desc.num_object_groups, attn_desc.group_kinds
+        )
+        staged = [
+            ki
+            for gid in read.gids
+            for ki in kgm.object_groups[gid].kernel_group_indices
+        ]
+        return read, staged
+
     def _apply_cb_rope_batched(
         self,
         gpu_context: BaseCacheContext,
         rope_state: _CBRopeState,
         batch_len: int,
         slots_to_rope: list[tuple[int, int, int]],
+        staged_kernel: list[int],
     ) -> None:
         """Re-RoPE the given tmp-pool slots in place (K-only, per kernel group).
 
@@ -1682,6 +2410,9 @@ class BlendV3Module(InstanceLivenessTarget):
             slots_to_rope (list[tuple[int, int, int]]): ``(slot_idx, old_st,
                 cur_st)`` per shifted slot — re-RoPE K from stored position
                 ``old_st`` to new position ``cur_st``.
+            staged_kernel (list[int]): Kernel-group indices blend staged (see
+                :meth:`_cb_staged_groups`); recurrent groups are absent and
+                stay untouched.
 
         Raises:
             RuntimeError: On a compressed (compress_ratio != 1) layout, a
@@ -1690,8 +2421,9 @@ class BlendV3Module(InstanceLivenessTarget):
         """
         if not slots_to_rope:
             return
-        num_groups = gpu_context.kv_layer_groups_manager.num_kernel_groups
-        for group_idx in range(num_groups):
+        if not rope_state.cos_sin_caches:
+            return  # NoPE model: stored K is position-independent.
+        for group_idx in staged_kernel:
             group = gpu_context.kv_layer_groups_manager.kernel_groups[group_idx]
             all_slots = [
                 gpu_context.get_temp_kernel_group_buffer(slot_idx, group_idx)
@@ -1712,8 +2444,10 @@ class BlendV3Module(InstanceLivenessTarget):
                 rot,
             )
             # Per-group rope cache: dual-RoPE models rotate each
-            # kernel group with its own theta's cos/sin.
+            # kernel group with its own theta's cos/sin. Non-None here: the
+            # NoPE (zero-cache) case returned at the top of this method.
             group_cos_sin = rope_state.cache_for_group(group.engine_group_idx)
+            assert group_cos_sin is not None
             if rot_offset > 0 and int(group_cos_sin.shape[1]) != rot[1]:
                 raise RuntimeError(
                     f"CB re-RoPE: group {group_idx} declares rope width "
@@ -1782,6 +2516,7 @@ class BlendV3Module(InstanceLivenessTarget):
         resolved_groups: "list[tuple[torch.Tensor, int]]",
         batch: "list[tuple[CBMatchResult, Any]]",
         head_size: int,
+        staged_kernel: list[int],
     ) -> None:
         """Scatter one tmp-slot batch into the paged KV, one launch per
         (kernel group, tmp slot), straight from each slot's contiguous buffer
@@ -1791,9 +2526,13 @@ class BlendV3Module(InstanceLivenessTarget):
 
         Args:
             gpu_context (GPUCacheContext): The instance's GPU cache context.
-            resolved_groups: Per kernel group ``(block_ids, block_size)``.
+            resolved_groups: Per STAGED kernel group ``(block_ids,
+                block_size)``, positionally aligned with ``staged_kernel``.
             batch: ``(match, memory_obj)`` pairs; slot ``i`` holds ``batch[i]``.
             head_size: RoPE head size forwarded to the kernel.
+            staged_kernel: Kernel-group indices blend staged (see
+                :meth:`_cb_staged_groups`); recurrent groups are absent and
+                never scattered.
         """
         kgm = gpu_context.kv_layer_groups_manager
         tok_counts = [int(r.cur_ed - r.cur_st) for (r, _) in batch]
@@ -1809,9 +2548,9 @@ class BlendV3Module(InstanceLivenessTarget):
             ]
         )
         slot_mappings = _group_slot_mappings(resolved_groups, pos)
-        for group_idx in range(kgm.num_kernel_groups):
-            _, group_bs = resolved_groups[group_idx]
-            slot_mapping = slot_mappings[group_idx]
+        for pos_idx, group_idx in enumerate(staged_kernel):
+            _, group_bs = resolved_groups[pos_idx]
+            slot_mapping = slot_mappings[pos_idx]
             # Per-group block count: under HMA the sliding group has fewer
             # blocks than the full group, so gpu_context.num_blocks (group
             # 0's) would truncate the other groups' bounds check.
@@ -1867,20 +2606,71 @@ class BlendV3Module(InstanceLivenessTarget):
         gpu_context: BaseCacheContext,
         rope_state: _CBRopeState,
         max_batch: int,
-    ) -> "tuple[list[Any], list[torch.Tensor]] | None":
+    ) -> "tuple[list[Any], list[list[torch.Tensor]], list[int]] | None":
         """Resolve the request-invariant plan half (cached per context in
         ``_cb_plan_invariants``).
 
-        Returns ``(group_specs, object_group_buffers)`` with slot-mapping
-        fields as placeholders for the per-request stamp, or ``None`` on an
-        unsupported layout (compressed / kv_size / dtype / head geometry).
+        Returns ``(group_specs, slot_group_buffers, og_sizes)`` with
+        slot-mapping fields as placeholders for the per-request stamp, or
+        ``None`` on an unsupported layout (compressed / kv_size / dtype /
+        head geometry). ``group_specs`` covers the STAGED kernel groups (see
+        :meth:`_cb_staged_groups`) in staged order; ``slot_group_buffers``
+        is one destination view per (batch slot, read object group);
+        ``og_sizes`` is each read object group's per-slot byte size (the
+        per-group H2D size check).
         """
         kgm = gpu_context.kv_layer_groups_manager
         cb_group_spec = device_ops.CBGroupSpec
+        read, staged_kernel = self._cb_staged_groups(gpu_context)
+        # Private staging pool. The context's shared temp slot buffers are
+        # also the STORE path's gather staging
+        # (lmcache_driven_transfer.get_temp_object_group_buffer), which keeps
+        # using them for seconds after each request while the L1 commit
+        # drains; staging retrieves into the shared slots therefore required
+        # a device-wide synchronize before every plan (measured 450-1145 ms
+        # behind commit copies in commit-heavy steady state, vs 4-9 ms of
+        # plan math). A retrieve-owned pool with the same slot/group layout
+        # removes the sharing entirely: the store may gather concurrently,
+        # and the scoped event (see _build_cb_retrieve_plan_flat) orders
+        # retrieve-vs-retrieve slot reuse.
+        #
+        # The pool's slot layout is COMPACT over the read object groups
+        # (attention, then aux): unlike the shared pool it does not reserve
+        # room for recurrent-state groups — blend never stages them, and
+        # mirroring their region would grow every slot by the state-page
+        # footprint. Kernel-group offsets are therefore rebuilt here from
+        # each group's offset within its own object group plus the compact
+        # object-group base, not copied from the shared pool's geometry.
+        og_sizes: list[int] = []
+        og_off: list[int] = []
+        _off = 0
+        for gid in read.gids:
+            og_buf = gpu_context.get_temp_object_group_buffer(0, gid)
+            og_off.append(_off)
+            og_sizes.append(int(og_buf.nbytes))
+            _off += int(og_buf.nbytes)
+        slot_bytes = _off
+        slot_stride = (slot_bytes + 255) & ~255
+        private_pool = torch.empty(
+            max_batch * slot_stride, dtype=torch.uint8, device=gpu_context.device
+        )
+        private_base = int(private_pool.data_ptr())
+        gid_of_kernel = {
+            ki: pos
+            for pos, gid in enumerate(read.gids)
+            for ki in kgm.object_groups[gid].kernel_group_indices
+        }
         group_specs: list[Any] = []
-        for group_idx in range(kgm.num_kernel_groups):
+        for group_idx in staged_kernel:
             group = kgm.kernel_groups[group_idx]
             buf0 = gpu_context.get_temp_kernel_group_buffer(0, group_idx)
+            gid_pos = gid_of_kernel[group_idx]
+            og_base = int(
+                gpu_context.get_temp_object_group_buffer(
+                    0, read.gids[gid_pos]
+                ).data_ptr()
+            )
+            group_off = og_off[gid_pos] + (int(buf0.data_ptr()) - og_base)
             num_layers, slot_tokens, hidden_dim = (
                 int(buf0.shape[1]),
                 int(buf0.shape[2]),
@@ -1892,7 +2682,7 @@ class BlendV3Module(InstanceLivenessTarget):
                     group_idx
                 ).data_ptr(),
                 temp_buffer_ptrs=[
-                    gpu_context.get_temp_kernel_group_buffer(slot, group_idx).data_ptr()
+                    private_base + slot * slot_stride + group_off
                     for slot in range(max_batch)
                 ],
                 num_layers=num_layers,
@@ -1908,12 +2698,12 @@ class BlendV3Module(InstanceLivenessTarget):
                 is_neox=rope_state.is_neox_style,
             )
             rot = rope_state.rot_for_group(group.engine_group_idx, buf0.dtype)
-            if rot is None:
-                # Skipped group (declared [] or quantized): staging + scatter
-                # only. cos_sin_cache == 0 disables native rope, so the
-                # rope-only fields are never read and the dtype gate below
-                # must not run (a uint8 group would knock every group off
-                # the native plan).
+            if rot is None or not rope_state.cos_sin_caches:
+                # Skipped group — declared [], quantized, or a NoPE model (no
+                # cos/sin cache at all): staging + scatter only.
+                # cos_sin_cache == 0 disables native rope, so the rope-only
+                # fields are never read and the dtype gate below must not run
+                # (a uint8 group would knock every group off the native plan).
                 group_specs.append(
                     cb_group_spec(
                         cos_sin_cache=0,
@@ -1942,7 +2732,10 @@ class BlendV3Module(InstanceLivenessTarget):
                 )
             except RuntimeError:
                 return None
+            # Non-None here: the NoPE (zero-cache) case took the skipped-group
+            # branch above for every group.
             group_cos_sin = rope_state.cache_for_group(group.engine_group_idx)
+            assert group_cos_sin is not None
             if rot_offset > 0 and int(group_cos_sin.shape[1]) != rot[1]:
                 return None
 
@@ -1957,11 +2750,18 @@ class BlendV3Module(InstanceLivenessTarget):
                     **spec_common,
                 )
             )
-        object_group_buffers = [
-            gpu_context.get_temp_object_group_buffer(slot, 0)
+        slot_group_buffers = [
+            [
+                private_pool[
+                    slot * slot_stride + og_off[g] : slot * slot_stride
+                    + og_off[g]
+                    + og_sizes[g]
+                ]
+                for g in range(len(read.gids))
+            ]
             for slot in range(max_batch)
         ]
-        return group_specs, object_group_buffers
+        return group_specs, slot_group_buffers, og_sizes
 
     def _build_cb_retrieve_plan_flat(
         self,
@@ -1986,9 +2786,10 @@ class BlendV3Module(InstanceLivenessTarget):
         if not pairs:
             return None
         # Native staging requires the lazy-allocator (pin-chunked) host path.
-        for _, memory_obj in pairs:
-            if not isinstance(memory_obj.parent(), LazyMemoryAllocator):
-                return None
+        for _, chunk_objs in pairs:
+            for memory_obj in chunk_objs:
+                if not isinstance(memory_obj.parent(), LazyMemoryAllocator):
+                    return None
 
         # Specs are invariant per paged registration except the slot-mapping
         # fields: cache them per context, re-stamp per request (the full
@@ -2008,40 +2809,32 @@ class BlendV3Module(InstanceLivenessTarget):
                 return None
             cached = (rope_state, max_batch, resolved)
             self._cb_plan_invariants[gpu_context] = cached
-        group_specs, object_group_buffers = cached[2]
+        group_specs, slot_group_buffers, og_sizes = cached[2]
         num_groups = len(group_specs)
+        n_read = len(og_sizes)
         wave = max_batch // 2
 
         n = len(pairs)
-        # One row per chunk: cur_st, cur_ed, old_st, src ptr, nbytes, host off.
-        chunk_table = np.array(
-            [
-                (
-                    r.cur_st,
-                    r.cur_ed,
-                    r.old_st,
-                    memory_obj.data_ptr,
-                    memory_obj.get_size(),
-                    memory_obj.meta.address,
-                )
-                for r, memory_obj in pairs
-            ],
-            dtype=np.int64,
+        # Per-chunk position columns plus per-(chunk, read group) source
+        # matrices — each chunk stages one H2D row per read object group.
+        pos_table = np.array(
+            [(r.cur_st, r.cur_ed, r.old_st) for r, _ in pairs], dtype=np.int64
         )
-        cur_st, cur_ed, old_st = (
-            chunk_table[:, 0],
-            chunk_table[:, 1],
-            chunk_table[:, 2],
+        cur_st, cur_ed, old_st = pos_table[:, 0], pos_table[:, 1], pos_table[:, 2]
+        src = np.array(
+            [[o.data_ptr for o in objs] for _, objs in pairs], dtype=np.int64
         )
-        src, nbytes, host_off = (
-            chunk_table[:, 3],
-            chunk_table[:, 4],
-            chunk_table[:, 5],
+        nbytes = np.array(
+            [[o.get_size() for o in objs] for _, objs in pairs], dtype=np.int64
         )
-        buf_bytes = int(object_group_buffers[0].nbytes)
-        if (nbytes != buf_bytes).any():
-            # Size mismatch: the fallback path raises the descriptive error.
-            return None
+        host_off = np.array(
+            [[o.meta.address for o in objs] for _, objs in pairs], dtype=np.int64
+        )
+        for g in range(n_read):
+            if (nbytes[:, g] != og_sizes[g]).any():
+                # Size mismatch: the fallback path raises the descriptive
+                # error.
+                return None
 
         # Shared logical positions + per-group slot mappings, in numpy on
         # pinned staging with one async H2D per group (persistent buffers).
@@ -2065,6 +2858,32 @@ class BlendV3Module(InstanceLivenessTarget):
         pinned, pinned_np, dev_buf = self._cb_slot_buffers(
             gpu_context, num_groups, n_pos
         )
+        # Cross-request barrier, scoped to this context's previous retrieve
+        # (#59a). The buffers above (and the temp slot buffers the exec
+        # stages into) are per-context singletons: the previous retrieve's
+        # H2D of ``pinned`` and its kernels reading ``dev_buf`` may still be
+        # in flight when this request rewrites ``pinned_np`` — a HOST write
+        # no stream-side wait can order. Host-synchronizing an event
+        # recorded after the previous exec covers all of it: the native call
+        # keeps its kernels on the caller's stream and blocks that stream on
+        # the staging stream's event every step (csrc/blend_kernels.cu), so
+        # the event's stream position transitively includes the staging
+        # copies. The three "scoped event alone is unsound" refutations
+        # (3-8 rejections; 18 rejections + blends 1/24 in perf_cb_final;
+        # deterministic chunk-0 identity rejection every request in
+        # rot_cb_100k_scoped) all trace to ONE cause: retrieve staging used
+        # the context's SHARED temp slots, which are also the store path's
+        # gather staging, occupied for seconds after each request — no
+        # retrieve-side event can order against store-side work. The scoped
+        # event is sound ONLY together with the retrieve-owned staging pool
+        # (_resolve_cb_plan_invariants). The device-wide synchronize
+        # alternative is correct but unscoped: it serializes retrieves
+        # behind unrelated context work — measured 596-619 ms per request
+        # behind the store leg's L1-commit copies at 98.5k-token pacing
+        # (the plan's own math is 4-9 ms).
+        prev_ev = self._cb_plan_done_events.pop(gpu_context, None)
+        if prev_ev is not None:
+            prev_ev.synchronize()
         div_mod: "dict[int, tuple[np.ndarray, np.ndarray]]" = {}
         for gi, ((block_ids_np, group_bs), spec) in enumerate(
             zip(cpu_block_tables, group_specs, strict=True)
@@ -2084,7 +2903,6 @@ class BlendV3Module(InstanceLivenessTarget):
             spec.slot_mapping_capacity = n_pos
         # The device staging must outlive the native call.
         keepalive = [dev_buf]
-
         # Waves of `wave` chunks per run, alternating slot halves.
         slot_of = np.empty(n, dtype=np.int64)
         slot_arange = np.arange(wave, dtype=np.int64)
@@ -2105,13 +2923,28 @@ class BlendV3Module(InstanceLivenessTarget):
         tok_off = np.zeros(n, dtype=np.int64)
         np.cumsum(n_tok[:-1], out=tok_off[1:])
 
+        # One staging row per (chunk, read object group), chunk-major: the
+        # destination is that slot's compact per-group view. Row counts feed
+        # step_offsets column 0 below (staging_end * n_read).
         obj_buf_ptrs = np.asarray(
-            [buf.data_ptr() for buf in object_group_buffers], dtype=np.int64
+            [[buf.data_ptr() for buf in bufs] for bufs in slot_group_buffers],
+            dtype=np.int64,
         )
-        staging = np.stack([obj_buf_ptrs[slot_of], src, nbytes, host_off], axis=1)
+        dest = obj_buf_ptrs[slot_of]  # (n, n_read)
+        staging = np.stack(
+            [dest.ravel(), src.ravel(), nbytes.ravel(), host_off.ravel()], axis=1
+        )
 
         groups_arr = np.arange(num_groups, dtype=np.int64)
         shifted = old_st != cur_st
+        if not rope_state.cos_sin_caches:
+            # NoPE model: a shifted match needs no re-RoPE, and emitting the
+            # rope rows anyway costs twice — pybind unpacks the tables into C++
+            # structs while the GIL is still HELD (release happens after the
+            # unpack), then the executor walks ramp-rope entries that cannot
+            # change a value. Marking nothing shifted drops both and leaves the
+            # staging/scatter tables untouched.
+            shifted = np.zeros_like(shifted)
         n_shifted = int(shifted.sum())
         ropes = np.stack(
             [
@@ -2139,7 +2972,7 @@ class BlendV3Module(InstanceLivenessTarget):
         ).astype(np.int64, copy=False)
         step_offsets = np.stack(
             [
-                staging_end,
+                staging_end * n_read,
                 np.cumsum(shifted_per_step) * num_groups,
                 staging_end * num_groups,
             ],
@@ -2199,6 +3032,11 @@ class BlendV3Module(InstanceLivenessTarget):
         gpu_context = entry.cache_context
         rope_state = self._cb_rope_state[instance_id]
         chunk_size = self._ctx.chunk_size
+        # Blend's read set over this registration's object groups: attention
+        # (+ standalone aux), never recurrent-state groups. Under the legacy
+        # fused layout this is object group 0 and every kernel group.
+        read_groups, staged_kernel = self._cb_staged_groups(gpu_context)
+        n_read = len(read_groups.gids)
 
         _retrieve_t0 = time.perf_counter()
 
@@ -2241,8 +3079,23 @@ class BlendV3Module(InstanceLivenessTarget):
 
         cb_match_result = sorted(cb_match_result, key=lambda r: r.cur_st)
         # vLLM may call retrieve twice (partial- then full-block alloc); skip
-        # ranges already scattered (blocks never move mid-prefill), returning
-        # before the obj-key/prefetched-read machinery (~7-20 ms).
+        # ranges already scattered, returning before the obj-key/
+        # prefetched-read machinery (~7-20 ms). "Blocks never move
+        # mid-prefill" holds for vLLM KV blocks but NOT for the
+        # connector-injected aux receive pages: the worker can assign a
+        # DIFFERENT aux pool page on the repeat call, and a destination-blind
+        # skip then leaves the new page empty — the worker validates it,
+        # rejects, and the request silently full-recomputes (observed:
+        # f1_tp1_r64_evfix 19:34:31, scatter OK then "no-op success" then
+        # empty-page rejection). Qualify the applied set with a fingerprint
+        # of the FULL destination table so a repeat with changed block ids
+        # re-scatters everything (idempotent for unmoved KV blocks,
+        # corrective for reassigned aux pages).
+        dest_fp = zlib.crc32(
+            np.asarray(
+                [b for grp in gpu_block_ids for b in grp], dtype=np.int64
+            ).tobytes()
+        )
         applied_ranges = self._cb_applied_match_ranges
         applied_key = (key.request_id, key.worker_id)
         prior_applied = applied_ranges.get(applied_key)
@@ -2250,11 +3103,11 @@ class BlendV3Module(InstanceLivenessTarget):
             cb_match_result = [
                 r
                 for r in cb_match_result
-                if (r.hash, r.cur_st, r.cur_ed) not in prior_applied
+                if (r.hash, r.cur_st, r.cur_ed, dest_fp) not in prior_applied
             ]
             if not cb_match_result:
                 return _noop_success("all ranges already applied for this worker")
-        applied_now: "set[tuple[bytes, int, int]]" = set()
+        applied_now: "set[tuple[bytes, int, int, int]]" = set()
         # Partial-alloc first call: every match can be beyond the allocated
         # slots -> return before the obj-key machinery. Read locks stay held
         # for the full-alloc follow-up, as the in-loop drop path leaves them.
@@ -2262,7 +3115,10 @@ class BlendV3Module(InstanceLivenessTarget):
             try:
                 slot_bound = min(
                     len(gpu_block_ids[kg.engine_group_idx]) * kg.tokens_per_block
-                    for kg in gpu_context.kv_layer_groups_manager.kernel_groups
+                    for kg in (
+                        gpu_context.kv_layer_groups_manager.kernel_groups[i]
+                        for i in staged_kernel
+                    )
                 )
             except (IndexError, TypeError):
                 slot_bound = None
@@ -2274,18 +3130,27 @@ class BlendV3Module(InstanceLivenessTarget):
         with self._lookup_obj_keys_lock:
             cached = self._lookup_obj_keys_cache.pop(key.request_id, None)
         if cached is not None and all(r.hash in cached for r in cb_match_result):
-            # The lookup cached all-ranks obj keys (world_size per hash). This
-            # retrieve is per-worker, so select THIS rank's key -> M objects, not
-            # M*world_size (else the zip below silently truncates and mispairs
-            # ranks at TP>1). Mirrors the non-cached path's per-worker resolve.
+            # The lookup cached all-ranks obj keys per hash, group-major then
+            # rank-minor (n_read * world_size entries). This retrieve is
+            # per-worker, so select THIS rank's key per read group -> n_read
+            # objects per match, not n_read*world_size (else the pairing
+            # below silently truncates and mispairs ranks at TP>1). Mirrors
+            # the non-cached path's per-worker resolve.
             if key.worker_id is not None and key.world_size > 1:
-                all_obj_keys = [cached[r.hash][key.worker_id] for r in cb_match_result]
+                ws = key.world_size
+                all_obj_keys = [
+                    cached[r.hash][g * ws + key.worker_id]
+                    for r in cb_match_result
+                    for g in range(n_read)
+                ]
             else:
                 all_obj_keys = [k for r in cb_match_result for k in cached[r.hash]]
         else:
-            all_obj_keys = ipc_key_to_object_keys(
-                key, [r.hash for r in cb_match_result], [0]
-            )[0]
+            # Worker-specific key -> one key per (hash, read group),
+            # chunk-major, matching the cached path's ordering.
+            all_obj_keys = _cb_chunk_major_object_keys(
+                key, [r.hash for r in cb_match_result], read_groups.gids
+            )
 
         # Lookup read-locked the full found set, but the connector may have
         # dropped some matches (parent-covered / misaligned) before retrieve,
@@ -2316,50 +3181,59 @@ class BlendV3Module(InstanceLivenessTarget):
         logger.debug("CB V3 retrieving object keys: %s", all_obj_keys)
 
         # CB v3 only supports uncompressed single-block-id-space layouts
-        # (enforced per group in ``_apply_cb_rope_batched``), so the first
-        # kernel group's chunk geometry is representative.
+        # (enforced per group in ``_apply_cb_rope_batched``), so the
+        # attention object group's first kernel group is representative.
         tokens_per_block = gpu_context.kv_layer_groups_manager.kernel_groups[
-            0
+            staged_kernel[0]
         ].tokens_per_block
         if chunk_size % tokens_per_block != 0:
             raise ValueError(
                 f"chunk_size {chunk_size} must be a multiple of "
                 f"tokens_per_block {tokens_per_block}"
             )
-        num_groups = gpu_context.kv_layer_groups_manager.num_kernel_groups
+
+        # Retrieve-owned stream: never the context's shared stream, which
+        # carries the store path's multi-second gather/commit copies (FIFO
+        # behind them re-creates the device-sync stall as a scatter wait).
+        retrieve_stream = self._cb_retrieve_streams.get(gpu_context)
+        if retrieve_stream is None:
+            if gpu_context.device.type == "cuda":
+                retrieve_stream = torch_dev.Stream(device=gpu_context.device)
+            else:
+                retrieve_stream = gpu_context.stream
+            self._cb_retrieve_streams[gpu_context] = retrieve_stream
 
         with (
             torch_dev.device(gpu_context.device),
-            torch_dev.stream(gpu_context.stream),
+            torch_dev.stream(retrieve_stream),
         ):
             check_interprocess_event_support()
             event = torch_dev.Event(interprocess=True)
 
-            # One staged block-id tensor per engine group, indexed by group.
-            block_ids_per_group_gpu = gpu_context.stage_block_ids(gpu_block_ids)
-
-            # Resolve each kernel group's block table + block size once. Select
-            # by engine_group_idx (kernel groups may share one, e.g. MiniMax-M3).
-            # The CPU (numpy) tables feed the native plan's slot-mapping math;
-            # the GPU tensors feed the Python fallback loop.
+            # Resolve each kernel group's block table + block size once.
+            # Select by engine_group_idx (kernel groups may share one, e.g.
+            # MiniMax-M3). Only the CPU (numpy) tables are built here — they
+            # feed the native plan's slot-mapping math. The GPU staging
+            # (stage_block_ids) writes the context's SHARED block-id buffer,
+            # which the store path also stages into, so it is deferred to the
+            # Python fallback branch, which is the only consumer and already
+            # runs behind a device-wide synchronize.
             kgm = gpu_context.kv_layer_groups_manager
             block_ids_np = [np.asarray(b, dtype=np.int64) for b in gpu_block_ids]
-            resolved_groups: list[tuple[torch.Tensor, int]] = []
             cpu_block_tables: "list[tuple[np.ndarray, int]]" = []
-            for group_idx in range(num_groups):
+            for group_idx in staged_kernel:
                 eg_idx = kgm.kernel_groups[group_idx].engine_group_idx
-                if eg_idx >= len(block_ids_per_group_gpu):
+                if eg_idx >= len(gpu_block_ids):
                     # Engine groups have independent block tables under HMA;
                     # substituting another group's table would scatter KV into
                     # the wrong physical blocks (silent corruption).
                     raise ValueError(
                         f"CB retrieve: kernel group {group_idx} maps to engine "
                         f"group {eg_idx}, but only "
-                        f"{len(block_ids_per_group_gpu)} block table(s) were "
+                        f"{len(gpu_block_ids)} block table(s) were "
                         "provided."
                     )
                 group_bs = kgm.kernel_groups[group_idx].tokens_per_block
-                resolved_groups.append((block_ids_per_group_gpu[eg_idx], group_bs))
                 cpu_block_tables.append((block_ids_np[eg_idx], group_bs))
 
             self._event_bus.publish_on_stream(
@@ -2383,7 +3257,7 @@ class BlendV3Module(InstanceLivenessTarget):
             vllm_event = torch_dev.Event.from_ipc_handle(
                 gpu_context.device, event_ipc_handle
             )
-            vllm_event.wait(stream=gpu_context.stream)
+            vllm_event.wait(stream=retrieve_stream)
 
             # Stage marks for the scatter_ms log line (CPU enqueue wall time):
             # fetch = L1 prefetched read, plan = flat-plan table build,
@@ -2403,15 +3277,29 @@ class BlendV3Module(InstanceLivenessTarget):
                         return event.ipc_handle(), False
 
                     # Per-token scatter handles any cur_st; just bound the
-                    # matched range to the allocated slots.
-                    pairs: list[tuple[CBMatchResult, Any]] = []
+                    # matched range to the allocated slots. Each match owns
+                    # n_read consecutive memory objects (chunk-major: one per
+                    # read object group).
+                    if len(memory_objs) != len(cb_match_result) * n_read:
+                        raise ValueError(
+                            f"CB retrieve: {len(memory_objs)} prefetched "
+                            f"object(s) for {len(cb_match_result)} match(es) "
+                            f"x {n_read} read group(s)."
+                        )
+                    grouped_objs = [
+                        tuple(memory_objs[i * n_read : (i + 1) * n_read])
+                        for i in range(len(cb_match_result))
+                    ]
+                    pairs: list[tuple[CBMatchResult, tuple[Any, ...]]] = []
                     # Bound by the smallest group: under HMA the sliding group
                     # has fewer blocks than the full group, so [0] isn't safe.
                     num_slots = min(
-                        int(block_ids.numel()) * group_bs
-                        for block_ids, group_bs in resolved_groups
+                        int(block_ids.shape[0]) * group_bs
+                        for block_ids, group_bs in cpu_block_tables
                     )
-                    for r, memory_obj in zip(cb_match_result, memory_objs, strict=True):
+                    for r, chunk_objs in zip(
+                        cb_match_result, grouped_objs, strict=True
+                    ):
                         if r.cur_ed > num_slots:
                             logger.warning(
                                 "Dropping CB match cur_st=%d cur_ed=%d: exceeds "
@@ -2422,7 +3310,7 @@ class BlendV3Module(InstanceLivenessTarget):
                                 key.request_id,
                             )
                             continue
-                        pairs.append((r, memory_obj))
+                        pairs.append((r, chunk_objs))
 
                     # cb.scatter span (GPU): the L1->paged write of every
                     # applied match. Re-RoPE is folded in (n_shifted) — it is
@@ -2481,18 +3369,42 @@ class BlendV3Module(InstanceLivenessTarget):
                         _stage_ms["exec"] = (time.perf_counter() - _stage_t) * 1000
                         runs = []  # plan covers every wave; skip the loop
 
+                    resolved_groups: list[tuple[torch.Tensor, int]] = []
+                    if runs:
+                        # Fallback loop only: it stages into the CONTEXT's
+                        # shared temp slots and shared block-id buffer, which
+                        # the store path also uses (the native path stages
+                        # into the retrieve-owned pool and needs no
+                        # device-wide wait).
+                        if gpu_context.device.type == "cuda":
+                            torch_dev.synchronize(gpu_context.device)
+                        block_ids_per_group_gpu = gpu_context.stage_block_ids(
+                            gpu_block_ids
+                        )
+                        for group_idx in staged_kernel:
+                            eg_idx = kgm.kernel_groups[group_idx].engine_group_idx
+                            resolved_groups.append(
+                                (
+                                    block_ids_per_group_gpu[eg_idx],
+                                    kgm.kernel_groups[group_idx].tokens_per_block,
+                                )
+                            )
                     for run in runs:
                         for batch_start in range(0, len(run), max_batch):
                             batch = run[batch_start : batch_start + max_batch]
                             batch_len = len(batch)
 
-                            # (a) H2D fill into per-chunk tmp slots.
-                            for slot_idx, (_, memory_obj) in enumerate(batch):
-                                # Single object group => object_group_idx=0.
-                                flat_slot = gpu_context.get_temp_object_group_buffer(
-                                    slot_idx, 0
-                                )
-                                lmcache_memcpy_async_h2d(memory_obj, flat_slot)
+                            # (a) H2D fill into per-chunk tmp slots, one copy
+                            # per read object group (the shared temp buffer
+                            # exposes each object group's per-slot view).
+                            for slot_idx, (_, chunk_objs) in enumerate(batch):
+                                for g, gid in enumerate(read_groups.gids):
+                                    flat_slot = (
+                                        gpu_context.get_temp_object_group_buffer(
+                                            slot_idx, gid
+                                        )
+                                    )
+                                    lmcache_memcpy_async_h2d(chunk_objs[g], flat_slot)
 
                             # (b) Re-RoPE shifted (non-prefix) slots in place.
                             slots_to_rope = [
@@ -2501,7 +3413,11 @@ class BlendV3Module(InstanceLivenessTarget):
                                 if r.old_st != r.cur_st
                             ]
                             self._apply_cb_rope_batched(
-                                gpu_context, rope_state, batch_len, slots_to_rope
+                                gpu_context,
+                                rope_state,
+                                batch_len,
+                                slots_to_rope,
+                                staged_kernel,
                             )
 
                             # (c) Per-token slot scatter: partial vLLM blocks
@@ -2511,9 +3427,21 @@ class BlendV3Module(InstanceLivenessTarget):
                                 resolved_groups,
                                 batch,
                                 rope_state.head_size,
+                                staged_kernel,
                             )
 
-                    applied_now = {(r.hash, r.cur_st, r.cur_ed) for r, _ in pairs}
+                    applied_now = {
+                        (r.hash, r.cur_st, r.cur_ed, dest_fp) for r, _ in pairs
+                    }
+
+                    # Mark this retrieve's device work for the next request's
+                    # scoped barrier (native exec and fallback loop both ride
+                    # the current stream at this point; the native call joins
+                    # its staging stream into it per step).
+                    if gpu_context.device.type == "cuda":
+                        done_ev = torch_dev.Event()
+                        done_ev.record()
+                        self._cb_plan_done_events[gpu_context] = done_ev
 
                     self._event_bus.publish_on_stream(
                         gpu_context.cupy_stream,
@@ -2559,7 +3487,10 @@ class BlendV3Module(InstanceLivenessTarget):
             applied_entry = applied_ranges.setdefault(applied_key, set())
             applied_entry.update(applied_now)
             applied_ranges.move_to_end(applied_key)
-            while len(applied_ranges) > 4096:
+            # One entry per (request, worker), so scale the cap by world size to
+            # keep the same number of *requests* covered as at TP1.
+            cap = 4096 * max(1, int(key.world_size or 1))
+            while len(applied_ranges) > cap:
                 applied_ranges.popitem(last=False)
 
         _scatter_ms = (time.perf_counter() - _retrieve_t0) * 1000

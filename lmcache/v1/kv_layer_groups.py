@@ -207,6 +207,16 @@ class KernelGroupInfo:
     sw_size_tokens: int = -1
     """Sliding window size in logical tokens for this group's layers.
     ``-1`` means the layers are not sliding-window attention."""
+    standalone_object_group: bool = False
+    """Whether this group must form its own object group under
+    ``separate_object_groups`` instead of being bucketed by window size
+    (carried from ``EngineGroupInfo.standalone_object_group``; set for
+    connector-private groups such as the CacheBlend fused-aux pool)."""
+    recurrent_state: bool = False
+    """Whether this group's pages hold recurrent state snapshots (Mamba/GDN)
+    rather than per-token attention KV (carried from
+    ``EngineGroupInfo.recurrent_state``). Its window reflects restore
+    semantics, so ``full_sw_kv`` forcing must not widen it."""
 
     def __repr__(self) -> str:
         if not self.layer_indices:
@@ -275,6 +285,15 @@ class ObjectGroupInfo:
     """Cross-chunk sliding window size in LMCache chunks shared by every
     kernel group in this object group. ``-1`` means the kernel groups are
     not sliding-window attention."""
+
+    standalone: bool = False
+    """Whether this object group exists solely because its (single) kernel
+    group was flagged ``standalone_object_group`` (connector-private pool)."""
+
+    recurrent: bool = False
+    """Whether every kernel group in this object group holds recurrent state
+    pages (Mamba/GDN). Such groups keep their one-block window even under
+    ``full_sw_kv`` forcing."""
 
 
 class KVLayerGroupsManager:
@@ -425,6 +444,12 @@ class KVLayerGroupsManager:
                     tokens_per_block=tokens_per_block,
                     engine_group_idx=engine_group_idx,
                     sw_size_tokens=sw_size_tokens,
+                    standalone_object_group=(
+                        info.standalone_object_group if info is not None else False
+                    ),
+                    recurrent_state=(
+                        info.recurrent_state if info is not None else False
+                    ),
                 )
             )
 
@@ -568,21 +593,43 @@ class KVLayerGroupsManager:
         Returns:
             An :class:`AttnWindowDesc` with one entry per object group, in
             object-group order; the entry is ``-1`` for a non-sliding-window
-            group.
+            group. ``group_kinds`` labels each object group so consumers can
+            tell attention, recurrent-state, and connector-private standalone
+            groups apart.
 
         Note:
             With object-group separation disabled (the default), the result
             has a single full-attention entry.
         """
+        kinds = tuple(
+            "standalone"
+            if g.standalone
+            else ("recurrent" if g.recurrent else "attention")
+            for g in self._object_groups
+        )
         if self._full_sw_kv:
-            # full_sw_kv: every group reports full attention, no cross-chunk
-            # window skipping (mirrors get_subchunk_sw_size_tokens).
-            return AttnWindowDesc(num_chunks_in_sw=[-1] * len(self._object_groups))
+            # full_sw_kv: attention-pattern groups report full attention (no
+            # cross-chunk window skipping) because blended chunks are reused
+            # at arbitrary positions (mirrors get_subchunk_sw_size_tokens).
+            # Recurrent-state groups keep their one-block window: their pages
+            # are position-bound restore snapshots the blend never touches,
+            # and widening the window would force every chunk's state page to
+            # be present (and loaded) for a prefix hit.
+            return AttnWindowDesc(
+                num_chunks_in_sw=[
+                    (g.sw_size_chunks if g.sw_size_chunks >= 1 else -1)
+                    if g.recurrent
+                    else -1
+                    for g in self._object_groups
+                ],
+                group_kinds=kinds,
+            )
         return AttnWindowDesc(
             num_chunks_in_sw=[
                 w if w >= 1 else -1
                 for w in (g.sw_size_chunks for g in self._object_groups)
-            ]
+            ],
+            group_kinds=kinds,
         )
 
     def calculate_num_blocks(self, kernel_group_idx: int, num_tokens: int) -> int:
@@ -614,8 +661,13 @@ class KVLayerGroupsManager:
         """Bucket kernel groups into object groups.
 
         Puts all kernel groups into a single object group when object-group
-        separation is disabled (the default). Otherwise groups the kernel groups
-        by sliding-window size measured in number of chunks.
+        separation is disabled (the default). Otherwise groups the kernel
+        groups by sliding-window size measured in number of chunks, except
+        that groups flagged ``standalone_object_group`` (connector-private
+        pools, e.g. the CacheBlend fused-aux pool) each form their own object
+        group regardless of window size — their bytes must never share an
+        object layout with groups that a differently-registered client may
+        read.
 
         Args:
             engine_group_infos: LMCache-owned engine KV cache group metadata.
@@ -631,20 +683,38 @@ class KVLayerGroupsManager:
             ]
 
         chunk_size = self._lmcache_tokens_per_chunk
-        groups_by_sw_size: dict[int, list[int]] = defaultdict(list)
+        # Bucket key: (recurrent, sw_size_chunks) for window-bucketed groups —
+        # recurrent-state pages and sliding-window attention KV must never
+        # share an object even when their windows coincide (different
+        # consumption semantics, and full_sw_kv forcing treats them
+        # differently). A unique ("standalone", kernel_group_idx) key
+        # isolates flagged connector-private groups.
+        BucketKey = tuple[str, int] | tuple[bool, int]
+        groups_by_bucket: dict[BucketKey, list[int]] = defaultdict(list)
+        bucket_sw_size: dict[BucketKey, int] = {}
         for kernel_group_idx, group in enumerate(self._kernel_groups):
             if group.sw_size_tokens == -1:
                 sw_size_chunks = -1
             else:
                 sw_size_chunks = (group.sw_size_tokens + chunk_size - 1) // chunk_size
-            groups_by_sw_size[sw_size_chunks].append(kernel_group_idx)
+            bucket: BucketKey = (
+                ("standalone", kernel_group_idx)
+                if group.standalone_object_group
+                else (group.recurrent_state, sw_size_chunks)
+            )
+            groups_by_bucket[bucket].append(kernel_group_idx)
+            bucket_sw_size[bucket] = sw_size_chunks
         return [
             ObjectGroupInfo(
                 kernel_group_indices=kernel_group_indices,
-                sw_size_chunks=sw_size_chunks,
+                sw_size_chunks=bucket_sw_size[bucket],
+                standalone=bucket[0] == "standalone",
+                recurrent=all(
+                    self._kernel_groups[i].recurrent_state for i in kernel_group_indices
+                ),
             )
-            for sw_size_chunks, kernel_group_indices in sorted(
-                groups_by_sw_size.items(), key=lambda kv: kv[1][0]
+            for bucket, kernel_group_indices in sorted(
+                groups_by_bucket.items(), key=lambda kv: kv[1][0]
             )
         ]
 

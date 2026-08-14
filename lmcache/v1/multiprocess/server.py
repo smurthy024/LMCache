@@ -398,9 +398,14 @@ def run_cache_server(
                 )
                 mem_cfg.shm_name = ""
 
-    # blend engine: full per-chunk SWA KV. It also requires the
-    # single-object-group layout; BlendV3Module enforces that at
-    # construction (RuntimeError unless --no-separate-object-groups).
+    # blend engine: full per-chunk SWA KV, because a blended chunk is reused at
+    # an arbitrary position, so no cross-chunk window may be trimmed away.
+    # ``full_sw_kv`` widens only attention-pattern groups: recurrent-state
+    # (Mamba/GDN) groups keep their one-block restore window
+    # (KVLayerGroupsManager.get_attn_desc), which is what lets a blend server
+    # also serve a stock hybrid client. Both object-group layouts are
+    # supported -- BlendV3Module resolves its read set (attention + the
+    # standalone fused-aux group, never recurrent groups) per registration.
     is_blend = mp_config.engine_type == "blend"
 
     ctx = MPCacheServerContext(
