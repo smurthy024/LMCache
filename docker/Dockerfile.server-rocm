@@ -1,0 +1,23 @@
+# LMCache server sidecar image for AMD offload recipes.
+# Build context must include exactly one lmcache-*.whl at repo root (dist/).
+#
+# Example:
+#   docker build -f docker/Dockerfile.server-rocm \
+#     --build-arg BASE_IMAGE=vllm/vllm-openai-rocm:v0.27.1 \
+#     -t ghcr.io/smurthy024/lmcache-server:abort4136-rocm .
+
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.27.1
+FROM ${BASE_IMAGE}
+
+COPY dist/lmcache-*.whl /tmp/lmcache.whl
+
+RUN pip install --no-cache-dir /tmp/lmcache.whl && rm /tmp/lmcache.whl && \
+    pip install --no-cache-dir --no-deps \
+      cupy-rocm-7-0 fastrlock opentelemetry-exporter-prometheus redis \
+      sortedcontainers aiofile \
+    || pip install --no-cache-dir \
+      cupy-rocm-7-0 fastrlock opentelemetry-exporter-prometheus redis \
+      sortedcontainers aiofile
+
+ENTRYPOINT ["lmcache"]
+CMD ["server"]

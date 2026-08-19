@@ -1,0 +1,209 @@
+# Build LMCache wheels with PR #4136 (abort during MP retrieve) and publish to
+# smurthy024 GitHub Releases + GHCR.
+#
+# Wheels match DI offload recipes:
+#   - ROCm: torch 2.11 / vllm-openai-rocm:v0.27.1
+#   - cu129: CUDA 12.9 / vLLM nightly used on B300 offload
+#
+# Trigger manually after pushing fix/abort-during-retrieve-4136, or push to that branch.
+
+name: Publish abort4136 wheels and GHCR images
+
+on:
+  push:
+    branches:
+      - fix/abort-during-retrieve-4136
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  RELEASE_TAG: v0.5.3-abort4136
+  ROCM_IMAGE: rocm/dev-ubuntu-22.04:7.2.3-complete
+  TORCH_ROCM_SPEC: torch==2.11.0+rocm7.2
+  TORCH_ROCM_INDEX: https://download.pytorch.org/whl/rocm7.2
+  PYTORCH_ROCM_ARCH: gfx942;gfx950
+  ROCM_LOCAL_VERSION: rocm7.2
+  WHEEL_VERSION: 0.5.3+abort4136
+  ROCM_WHEEL_VERSION: 0.5.3+abort4136.rocm7.2
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-rocm-wheel:
+    name: Build ROCm wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk-space
+
+      - name: Build ROCm wheel
+        run: |
+          docker run --rm \
+            -e PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION="${ROCM_WHEEL_VERSION}" \
+            -e TORCH_ROCM_SPEC="${TORCH_ROCM_SPEC}" \
+            -e TORCH_ROCM_INDEX="${TORCH_ROCM_INDEX}" \
+            -v "${PWD}:/work/LMCache" \
+            --entrypoint bash "${ROCM_IMAGE}" \
+            /work/LMCache/.github/scripts/build_rocm_wheel.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rocm-wheel
+          path: dist/*.whl
+
+  build-cu129-wheel:
+    name: Build cu129 wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk-space
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install cibuildwheel
+        run: pip install cibuildwheel
+
+      - name: Build cu129 wheel
+        env:
+          CIBW_MANYLINUX_X86_64_IMAGE: docker.io/pytorch/manylinux2_28-builder:cuda12.9
+          CIBW_ENVIRONMENT: >-
+            TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0;10.0"
+            ENABLE_CXX11_ABI=1
+            LMCACHE_CUDA_MAJOR=12
+            SETUPTOOLS_SCM_PRETEND_VERSION=${{ env.WHEEL_VERSION }}
+            PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu129
+            PIP_CONSTRAINT=/project/cibw-constraints.txt
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+            auditwheel repair
+            --plat manylinux_2_28_x86_64
+            --exclude libtorch.so
+            --exclude libtorch_cuda.so
+            --exclude libtorch_python.so
+            --exclude libtorch_cpu.so
+            --exclude libc10.so
+            --exclude libc10_cuda.so
+            --exclude libcudart.so.12
+            -w {dest_dir} {wheel}
+          CIBW_TEST_COMMAND: "python {project}/.github/scripts/assert_native_ops.py"
+        run: python -m cibuildwheel --output-dir dist/cu129
+
+      - name: Collect wheel
+        run: |
+          mkdir -p dist
+          cp dist/cu129/*.whl dist/
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cu129-wheel
+          path: dist/*.whl
+
+  publish:
+    name: Release wheels and GHCR images
+    needs: [build-rocm-wheel, build-cu129-wheel]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Layout dist/
+        run: |
+          mkdir -p dist
+          cp artifacts/rocm-wheel/*.whl dist/
+          cp artifacts/cu129-wheel/*.whl dist/
+          ls -la dist/
+          python3 -c "import lmcache" 2>/dev/null || true
+          python3 <<'PY'
+          import glob
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 2, wheels
+          for w in wheels:
+              print("wheel:", w)
+          PY
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "${RELEASE_TAG}" --yes 2>/dev/null || true
+          gh release create "${RELEASE_TAG}" \
+            --title "LMCache ${RELEASE_TAG} (PR #4136 abort-during-retrieve)" \
+            --notes "$(cat <<'EOF'
+          Patched LMCache build containing [PR #4136](https://github.com/LMCache/LMCache/pull/4136): handle request abort during MP retrieve.
+
+          Fixes EngineCore crash when a client disconnects while KV offload/retrieve is in flight (vLLM scheduler `assert req_id in self.requests`).
+
+          ## Wheels
+
+          | Asset | Use in DI recipe |
+          | --- | --- |
+          | `lmcache-*-rocm7.2*.whl` | MI355 Flash-0731 offload (`v0.5.3-rocm` slot) |
+          | `lmcache-*-manylinux*.whl` (cu129) | B300 Pro-0813 offload (`v0.5.3-cu129` slot) |
+
+          ## GHCR sidecar images (optional)
+
+          - `ghcr.io/smurthy024/lmcache-server:abort4136-rocm`
+          - `ghcr.io/smurthy024/lmcache-server:abort4136-cu129`
+
+          Built from branch \`fix/abort-during-retrieve-4136\`.
+          EOF
+          )" \
+            --prerelease \
+            dist/*.whl
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ROCm server image
+        run: |
+          docker build \
+            -f docker/Dockerfile.server-rocm \
+            --build-arg BASE_IMAGE=vllm/vllm-openai-rocm:v0.27.1 \
+            -t "ghcr.io/smurthy024/lmcache-server:abort4136-rocm" \
+            -t "ghcr.io/smurthy024/lmcache-server:${RELEASE_TAG}-rocm" \
+            .
+          docker push "ghcr.io/smurthy024/lmcache-server:abort4136-rocm"
+          docker push "ghcr.io/smurthy024/lmcache-server:${RELEASE_TAG}-rocm"
+
+      - name: Build and push cu129 server image
+        run: |
+          docker build \
+            -f docker/Dockerfile.server-cu129 \
+            --build-arg BASE_IMAGE=vllm/vllm-openai:nightly-ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9 \
+            -t "ghcr.io/smurthy024/lmcache-server:abort4136-cu129" \
+            -t "ghcr.io/smurthy024/lmcache-server:${RELEASE_TAG}-cu129" \
+            .
+          docker push "ghcr.io/smurthy024/lmcache-server:abort4136-cu129"
+          docker push "ghcr.io/smurthy024/lmcache-server:${RELEASE_TAG}-cu129"
+
+      - name: Summary
+        run: |
+          echo "## Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Release: https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ghcr.io/smurthy024/lmcache-server:abort4136-rocm" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ghcr.io/smurthy024/lmcache-server:abort4136-cu129" >> "$GITHUB_STEP_SUMMARY"
