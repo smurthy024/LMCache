@@ -1,0 +1,118 @@
+name: Publish abort4136 cu129
+
+on:
+  push:
+    branches:
+      - fix/abort-during-retrieve-4136
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  RELEASE_TAG: v0.5.3-abort4136-cu129
+  IMAGE: ghcr.io/smurthy024/lmcache-server
+  IMAGE_TAG: abort4136-cu129
+  WHEEL_VERSION: 0.5.3+abort4136
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-and-publish:
+    name: Build and publish cu129
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/share/swift \
+            /usr/local/.ghcup
+          docker image prune -af
+          df -h /
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install cibuildwheel
+        run: pip install cibuildwheel
+
+      - name: Build cu129 cp312 wheel
+        env:
+          CIBW_BUILD: cp312-manylinux_x86_64
+          CIBW_MANYLINUX_X86_64_IMAGE: docker.io/pytorch/manylinux2_28-builder:cuda12.9
+          CIBW_ENVIRONMENT: >-
+            TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0;10.0"
+            ENABLE_CXX11_ABI=1
+            LMCACHE_CUDA_MAJOR=12
+            SETUPTOOLS_SCM_PRETEND_VERSION=${{ env.WHEEL_VERSION }}
+            PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu129
+            PIP_CONSTRAINT=/project/cibw-constraints.txt
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+            auditwheel repair
+            --plat manylinux_2_28_x86_64
+            --exclude libtorch.so
+            --exclude libtorch_cuda.so
+            --exclude libtorch_python.so
+            --exclude libtorch_cpu.so
+            --exclude libc10.so
+            --exclude libc10_cuda.so
+            --exclude libcudart.so.12
+            -w {dest_dir} {wheel}
+          CIBW_TEST_COMMAND: "python {project}/.github/scripts/assert_native_ops.py"
+        run: |
+          python -m cibuildwheel --output-dir wheelhouse
+          mkdir -p dist
+          cp wheelhouse/*.whl dist/
+          test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+
+      - name: Publish cu129 wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "${RELEASE_TAG}" --yes 2>/dev/null || true
+          gh release create "${RELEASE_TAG}" \
+            --title "LMCache abort4136 cu129" \
+            --notes "CUDA 12.9 / cp312 build containing LMCache PR #4136." \
+            --prerelease \
+            dist/*.whl
+
+      - name: Reclaim builder space
+        run: |
+          docker image prune -af
+          df -h /
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push cu129 image
+        run: |
+          docker build \
+            -f docker/Dockerfile.server-cu129 \
+            --build-arg BASE_IMAGE=vllm/vllm-openai:nightly-ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9 \
+            -t "${IMAGE}:${IMAGE_TAG}" \
+            -t "${IMAGE}:${RELEASE_TAG}" \
+            .
+          docker push "${IMAGE}:${IMAGE_TAG}"
+          docker push "${IMAGE}:${RELEASE_TAG}"
+
+      - name: Summary
+        run: |
+          echo "## cu129 published" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Release: https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Image: ${IMAGE}:${IMAGE_TAG}" >> "${GITHUB_STEP_SUMMARY}"
