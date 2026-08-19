@@ -82,6 +82,9 @@ jobs:
 
       - name: Build cu129 wheel
         env:
+          # DI vLLM images use Python 3.12. Building cp310, cp311, and cp313
+          # recompiles the native extension three extra times.
+          CIBW_BUILD: cp312-manylinux_x86_64
           CIBW_MANYLINUX_X86_64_IMAGE: docker.io/pytorch/manylinux2_28-builder:cuda12.9
           CIBW_ENVIRONMENT: >-
             TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0;10.0"
