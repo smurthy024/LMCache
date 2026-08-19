@@ -104,7 +104,6 @@ jobs:
         run: |
           docker build \
             -f docker/Dockerfile.server-cu129 \
-            --build-arg BASE_IMAGE=vllm/vllm-openai:nightly-ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9 \
             -t "${IMAGE}:${IMAGE_TAG}" \
             -t "${IMAGE}:${RELEASE_TAG}" \
             .

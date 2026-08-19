@@ -3,10 +3,10 @@
 #
 # Example:
 #   docker build -f docker/Dockerfile.server-cu129 \
-#     --build-arg BASE_IMAGE=vllm/vllm-openai:nightly-ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9 \
+#     --build-arg BASE_IMAGE=vllm/vllm-openai:v0.27.1-cu129 \
 #     -t ghcr.io/smurthy024/lmcache-server:abort4136-cu129 .
 
-ARG BASE_IMAGE=vllm/vllm-openai:nightly-ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9
+ARG BASE_IMAGE=vllm/vllm-openai:v0.27.1-cu129
 FROM ${BASE_IMAGE}
 
 COPY dist/lmcache-*.whl /tmp/lmcache.whl
