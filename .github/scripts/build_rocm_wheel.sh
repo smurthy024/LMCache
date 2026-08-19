@@ -37,6 +37,12 @@ apt-get install -y -q --no-install-recommends \
     python3.12 python3.12-dev python3.12-venv
 curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
 
+# Ubuntu 22.04's apt patchelf is 0.14.3; current auditwheel needs >= 0.14.5.
+curl -fsSL -o /tmp/patchelf.tar.gz \
+  https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz
+tar -xzf /tmp/patchelf.tar.gz -C /usr/local
+patchelf --version
+
 # The repo is bind-mounted from the CI runner (owned by a non-root UID) while
 # this container runs as root, so git refuses to operate on it. setup.py's
 # version/git introspection runs during the wheel build, so mark it safe.
