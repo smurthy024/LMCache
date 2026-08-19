@@ -11,14 +11,14 @@ permissions:
   packages: write
 
 env:
-  RELEASE_TAG: v0.5.3-abort4136-rocm
+  RELEASE_TAG: v0.5.3-abort4136-4396-rocm
   IMAGE: ghcr.io/smurthy024/lmcache-server
-  IMAGE_TAG: abort4136-rocm
+  IMAGE_TAG: abort4136-4396-rocm
   ROCM_IMAGE: rocm/dev-ubuntu-22.04:7.2.3-complete
   TORCH_ROCM_SPEC: torch==2.11.0+rocm7.2
   TORCH_ROCM_INDEX: https://download.pytorch.org/whl/rocm7.2
   PYTORCH_ROCM_ARCH: gfx942;gfx950
-  WHEEL_VERSION: 0.5.3+abort4136.rocm7.2
+  WHEEL_VERSION: 0.5.3+abort4136.4396.rocm7.2
 
 defaults:
   run:
@@ -63,7 +63,7 @@ jobs:
           gh release delete "${RELEASE_TAG}" --yes 2>/dev/null || true
           gh release create "${RELEASE_TAG}" \
             --title "LMCache abort4136 ROCm" \
-            --notes "ROCm 7.2 / cp312 build containing LMCache PR #4136." \
+            --notes "ROCm 7.2 / cp312 build containing LMCache PR #4136 (abort during retrieve) and PR #4396 (fs_native cache_salt + object_group_id)." \
             --prerelease \
             dist/*.whl
 
