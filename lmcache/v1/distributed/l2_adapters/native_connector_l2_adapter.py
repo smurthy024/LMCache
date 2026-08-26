@@ -22,6 +22,7 @@ from __future__ import annotations
 
 # Standard
 from collections import defaultdict
+from dataclasses import dataclass
 from functools import cache
 from typing import Any
 import ctypes
@@ -32,7 +33,10 @@ import threading
 from lmcache.lmcache_native import Bitmap
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.internal_api import L2StoreResult
+from lmcache.v1.distributed.internal_api import (
+    L2AdapterListener,
+    L2StoreResult,
+)
 from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
     L2TaskId,
@@ -132,6 +136,22 @@ def _obj_to_memoryview(
     return obj.byte_array  # type: ignore[return-value]
 
 
+@dataclass(frozen=True)
+class RecoveredL2Entry:
+    """An object discovered on persistent storage before adapter startup.
+
+    Attributes:
+        key: Decoded object key.
+        size_bytes: Persisted object size.
+        last_access_ns: Best-effort restart LRU timestamp recovered by the
+            backing connector.
+    """
+
+    key: ObjectKey
+    size_bytes: int
+    last_access_ns: int = 0
+
+
 class NativeConnectorL2Adapter(L2AdapterInterface):
     """
     Wraps a pybind-wrapped C++ IStorageConnector to
@@ -160,6 +180,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         type_name: str = "",
         extra_status: dict[str, Any] | None = None,
         pad_buffers_to_alignment: bool = False,
+        recovered_entries: list[RecoveredL2Entry] | None = None,
     ) -> None:
         """Initialize the adapter over a native connector client.
 
@@ -179,6 +200,11 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 native connectors whose I/O path requires aligned buffer
                 lengths (e.g. O_DIRECT file storage). See
                 ``_obj_to_memoryview``.
+            recovered_entries: Objects discovered on persistent storage
+                before this adapter started (e.g. from a prior process).
+                Seeds ``get_usage()``/eviction bookkeeping and
+                ``_key_sizes`` so previously-persisted keys are known
+                without a fresh store.
         """
         super().__init__(max_capacity_bytes=int(max_capacity_gb * (1024**3)))
         self._client = native_client
@@ -186,6 +212,26 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         self._type_name: str = type_name or type(native_client).__name__
         self._extra_status: dict[str, Any] = dict(extra_status or {})
         self._pad_buffers_to_alignment = pad_buffers_to_alignment
+
+        recovered_by_key: dict[ObjectKey, RecoveredL2Entry] = {}
+        for entry in recovered_entries or []:
+            if entry.size_bytes < 0:
+                raise ValueError("recovered entry size must be non-negative")
+            previous = recovered_by_key.get(entry.key)
+            if previous is None or entry.last_access_ns > previous.last_access_ns:
+                recovered_by_key[entry.key] = entry
+        # LRU batch creation iterates in reverse. Newest-first here therefore
+        # reconstructs an oldest-first eviction order at listener bootstrap.
+        self._recovered_entries = tuple(
+            sorted(
+                recovered_by_key.values(),
+                key=lambda entry: (
+                    entry.last_access_ns,
+                    _object_key_to_string(entry.key),
+                ),
+                reverse=True,
+            )
+        )
 
         # 3 distinct cross-platform notifiers for the L2 adapter
         # interface
@@ -220,7 +266,14 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         # at delete time (the native completion only carries booleans, not
         # sizes) so we can pass them to ``_notify_keys_deleted``. Aggregate
         # and per-user totals live in the base class — see ``get_usage``.
-        self._key_sizes: dict[ObjectKey, int] = {}
+        self._key_sizes: dict[ObjectKey, int] = {
+            entry.key: entry.size_bytes for entry in self._recovered_entries
+        }
+        self._recovered_keys = set(self._key_sizes)
+        self.seed_existing_keys(
+            list(self._key_sizes),
+            list(self._key_sizes.values()),
+        )
         # Pending store sizes: native future_id -> (keys, per_key_sizes).
         # Bridges the async store submit → demux completion gap so the
         # demux thread can fire ``_notify_keys_stored(keys, sizes)``.
@@ -420,6 +473,28 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
     # class tracks aggregate + per-user totals via ``_notify_keys_*``;
     # we feed it the byte sizes from each store/delete completion.
 
+    def register_listener(self, listener: L2AdapterListener) -> None:
+        """Register a listener and replay the recovered-key snapshot.
+
+        Args:
+            listener: Listener receiving future events and currently
+                recovered keys.
+        """
+        super().register_listener(listener)
+        if not self._recovered_entries:
+            return
+        with self._lock:
+            current_entries = [
+                (entry.key, self._key_sizes[entry.key])
+                for entry in self._recovered_entries
+                if entry.key in self._key_sizes
+            ]
+        if not current_entries:
+            return
+        keys = [key for key, _size in current_entries]
+        sizes = [size for _key, size in current_entries]
+        listener.on_l2_keys_stored(keys, sizes)
+
     # ---------------------------------------------------------------
     # Status Interface
     # ---------------------------------------------------------------
@@ -441,6 +516,14 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             "type": self._type_name,
         }
         status.update(self._extra_status)
+        status.update(
+            {
+                "recovered_keys": len(self._recovered_entries),
+                "recovered_bytes": sum(
+                    entry.size_bytes for entry in self._recovered_entries
+                ),
+            }
+        )
         return status
 
     # ---------------------------------------------------------------
@@ -584,16 +667,22 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                         self._load_efd.notify()
 
                     elif op_type == self._OP_DELETE:
-                        if result_bools is not None and lookup_keys is not None:
-                            for i, deleted in enumerate(result_bools):
-                                if not deleted:
-                                    continue
-                                key = lookup_keys[i]
-                                # Only notify (with size) for keys we've
-                                # actually accounted for via a prior store.
+                        if ok and lookup_keys is not None:
+                            if result_bools is None:
+                                acknowledged_keys = lookup_keys
+                            else:
+                                acknowledged_keys = [
+                                    key
+                                    for key, deleted in zip(
+                                        lookup_keys, result_bools, strict=False
+                                    )
+                                    if deleted or key in self._recovered_keys
+                                ]
+                            for key in acknowledged_keys:
                                 if key in self._key_sizes:
                                     sizes_deleted.append(self._key_sizes.pop(key))
                                     keys_deleted.append(key)
+                                    self._recovered_keys.discard(key)
                         evt = self._pending_delete_events.pop(task_id, None)
                         if evt is not None:
                             delete_done_events.append(evt)

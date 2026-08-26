@@ -225,7 +225,12 @@ bool FSConnector::do_single_delete(WorkerFSConn& conn, const std::string& key) {
   std::string filename = key_to_filename(key);
   auto file_path = conn.base_path / filename;
   std::error_code ec;
-  return std::filesystem::remove(file_path, ec);
+  bool removed = std::filesystem::remove(file_path, ec);
+  if (ec) {
+    throw std::runtime_error("remove failed: " + file_path.string() + ": " +
+                             ec.message());
+  }
+  return removed;
 }
 
 }  // namespace connector
