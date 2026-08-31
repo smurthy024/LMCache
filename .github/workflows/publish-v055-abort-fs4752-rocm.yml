@@ -1,4 +1,4 @@
-name: Publish v0.5.5 abort+fs4752 ROCm
+name: Publish v0.5.5 abort+fs4752 ROCm (nightly overlay)
 
 on:
   push:
@@ -11,14 +11,10 @@ permissions:
   packages: write
 
 env:
-  RELEASE_TAG: v0.5.5-abort4136-fs4752-rocm
+  RELEASE_TAG: v0.5.5-abort4136-fs4752-overlay-rocm
   IMAGE: ghcr.io/smurthy024/lmcache-server
-  IMAGE_TAG: v0.5.5-abort4136-fs4752-rocm
-  ROCM_IMAGE: rocm/dev-ubuntu-22.04:7.2.3-complete
-  TORCH_ROCM_SPEC: torch==2.11.0+rocm7.2
-  TORCH_ROCM_INDEX: https://download.pytorch.org/whl/rocm7.2
-  PYTORCH_ROCM_ARCH: gfx942;gfx950
-  WHEEL_VERSION: 0.5.5.dev47+abort4136.fs4752.rocm7.2
+  IMAGE_TAG: v0.5.5-abort4136-fs4752-overlay-rocm
+  WHEEL_VERSION: 0.5.5.dev47+abort4136.fs4752.overlay.rocm7.2
 
 defaults:
   run:
@@ -26,7 +22,7 @@ defaults:
 
 jobs:
   build-and-publish:
-    name: Build and publish ROCm
+    name: Overlay nightly-rocm + publish
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,34 +40,35 @@ jobs:
           docker image prune -af
           df -h /
 
-      - name: Build ROCm cp312 wheel
-        run: |
-          docker run --rm \
-            -e PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" \
-            -e SETUPTOOLS_SCM_PRETEND_VERSION="${WHEEL_VERSION}" \
-            -e TORCH_ROCM_SPEC="${TORCH_ROCM_SPEC}" \
-            -e TORCH_ROCM_INDEX="${TORCH_ROCM_INDEX}" \
-            -v "${PWD}:/work/LMCache" \
-            --entrypoint bash "${ROCM_IMAGE}" \
-            /work/LMCache/.github/scripts/build_rocm_wheel.sh
-          test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Publish ROCm wheel
+      - name: Install build deps (torch for CppExtension only; no HIP cuda_ops rebuild)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install wheel setuptools setuptools-scm numpy pybind11
+
+      - name: Build overlay wheel
+        env:
+          WHEEL_VERSION: ${{ env.WHEEL_VERSION }}
+          OUT_DIR: dist
+        run: |
+          chmod +x .github/scripts/build_nightly_overlay_rocm_wheel.sh
+          .github/scripts/build_nightly_overlay_rocm_wheel.sh
+
+      - name: Publish overlay wheel
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete "${RELEASE_TAG}" --yes 2>/dev/null || true
           gh release create "${RELEASE_TAG}" \
-            --title "LMCache v0.5.5 abort4136 + fs4752 ROCm" \
-            --notes "ROCm 7.2 / cp312 build from nightly (0.5.5.dev47) + PR #4136 (abort during retrieve) + PR #4752 (stable fs_native placement / salt key codec)." \
+            --title "LMCache v0.5.5 abort4136 + fs4752 ROCm (nightly overlay)" \
+            --notes "Official nightly-rocm cp312 hipified cuda_ops kept intact. Overlay: PR #4136 (abort, Python) + PR #4752 (fs_native / salt; Python + rebuilt lmcache_fs only)." \
             --prerelease \
             dist/*.whl
-
-      - name: Reclaim builder space
-        run: |
-          docker image rm "${ROCM_IMAGE}" 2>/dev/null || true
-          docker image prune -af
-          df -h /
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -93,7 +90,8 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## ROCm published" >> "${GITHUB_STEP_SUMMARY}"
+          echo "## ROCm overlay published" >> "${GITHUB_STEP_SUMMARY}"
           echo "- Release: https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}" >> "${GITHUB_STEP_SUMMARY}"
           echo "- Image: ${IMAGE}:${IMAGE_TAG}" >> "${GITHUB_STEP_SUMMARY}"
           echo "- Wheel version: ${WHEEL_VERSION}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Base: official nightly-rocm cuda_ops (HIP) preserved" >> "${GITHUB_STEP_SUMMARY}"
