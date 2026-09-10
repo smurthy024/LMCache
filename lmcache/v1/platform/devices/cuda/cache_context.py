@@ -355,6 +355,7 @@ class GPUCacheContext(BaseCacheContext):
         engine_type: EngineType = EngineType.VLLM,
         separate_object_groups: bool = False,
         full_sw_kv: bool = False,
+        max_batch_size: int = 4,
     ):
         # Kept for close(): raw-IPC wrappers hold driver-level mappings
         # that pin the exporter's device memory until explicitly closed.
@@ -440,7 +441,7 @@ class GPUCacheContext(BaseCacheContext):
             kv_layer_groups_manager=self.kv_layer_groups_manager_,
             lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
             device=self.device_,
-            max_batch_size=4,
+            max_batch_size=max_batch_size,
         )
 
         # GPU streams
@@ -467,21 +468,33 @@ class GPUCacheContext(BaseCacheContext):
         )
 
     def close(self) -> None:
-        """Drain the context stream, deregister the GDS staging buffer and
-        release the imported KV mappings (reverse of __init__).
+        """Drain the stream, close IPC wrappers, and drop CuPy/stream refs.
 
-        The stream is synchronized first so no in-flight kernel still
-        touches the mappings when they are unmapped. The wrapper close
-        unmaps raw CUDA IPC imports; without it a dead worker's KV pool
-        stays resident on this process's GPUs for the process lifetime.
-        The tensors built over those mappings must not be dereferenced
-        afterwards -- the caller (``_release_entries``) drops the context
-        right after this call.
+        Combines #4693 (synchronize before unmap so we don't hold the GIL
+        forever in wrapper.close) with #4261 (null CuPy ExternalStream /
+        tensor refs so IPC handles are not pinned by a refcycle / disabled GC).
         """
-        self.cuda_stream_.synchronize()
-        with torch_dev.stream(self.cuda_stream_):
-            get_gds_context().deregister_gpu_buffer(self._temp_buffer.buffer)
+        # 1. Drain in-flight work on this context's stream (#4693 / #4676).
+        if self.cuda_stream_ is not None:
+            self.cuda_stream_.synchronize()
+
+        # 2. Deregister the GDS staging buffer (reverse of __init__).
+        try:
+            if self.cuda_stream_ is not None and self._temp_buffer is not None:
+                with torch_dev.stream(self.cuda_stream_):
+                    get_gds_context().deregister_gpu_buffer(self._temp_buffer.buffer)
+        except Exception as e:
+            logger.warning("GPUCacheContext.close: GDS deregister failed: %s", e)
+
+        # 3. Close raw CUDA-IPC wrappers (unmap imported KV).
         self._close_kv_wrappers()
+
+        # 4. Break CuPy ExternalStream refcycles (#4261).
+        self.group_kv_pointers_ = None
+        self.kv_caches_ = None
+        self._temp_buffer = None
+        self.cupy_stream_ = None
+        self.cuda_stream_ = None
 
     def _close_kv_wrappers(self) -> None:
         """Close every KV wrapper, continuing past per-wrapper failures."""

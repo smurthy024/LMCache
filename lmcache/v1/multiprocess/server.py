@@ -378,6 +378,7 @@ def run_cache_server(
         null_block_id=mp_config.null_block_id,
         separate_object_groups=mp_config.separate_object_groups,
         full_sw_kv=is_blend,
+        max_batch_size=mp_config.max_batch_size,
     )
 
     modules = _build_modules(ctx, mp_config, coordinator_config)
