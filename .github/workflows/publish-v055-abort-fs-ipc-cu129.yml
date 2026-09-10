@@ -1,0 +1,98 @@
+name: Publish v0.5.5 abort+fs+ipc cu129 (nightly overlay)
+
+on:
+  push:
+    branches:
+      - v0.5.5-abort-fs-ipc
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  RELEASE_TAG: v0.5.5-abort-fs-ipc-overlay-cu129
+  IMAGE: ghcr.io/smurthy024/lmcache-server
+  IMAGE_TAG: v0.5.5-abort-fs-ipc-overlay-cu129
+  WHEEL_VERSION: 0.5.5.dev118+abort4136.fs4752.ipc4261.overlay
+  NIGHTLY_WHL_URL: https://github.com/LMCache/LMCache/releases/download/nightly/lmcache-0.5.5.dev118-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-and-publish:
+    name: Overlay nightly + publish cu129
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/share/swift \
+            /usr/local/.ghcup
+          docker image prune -af
+          df -h /
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build deps (torch for CppExtension only; no cuda_ops rebuild)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install wheel setuptools setuptools-scm numpy pybind11
+
+      - name: Build overlay wheel
+        env:
+          NIGHTLY_WHL_URL: ${{ env.NIGHTLY_WHL_URL }}
+          WHEEL_VERSION: ${{ env.WHEEL_VERSION }}
+          OUT_DIR: dist
+        run: |
+          chmod +x .github/scripts/build_nightly_overlay_cu129_wheel.sh
+          .github/scripts/build_nightly_overlay_cu129_wheel.sh
+
+      - name: Publish overlay wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "${RELEASE_TAG}" --yes 2>/dev/null || true
+          gh release create "${RELEASE_TAG}" \
+            --title "LMCache v0.5.5.dev118 abort+fs+ipc cu129 (nightly overlay)" \
+            --notes "Official nightly cp312 cuda_ops kept intact. Overlay: PR #4136 (abort) + PR #4752 (fs_native/salt; rebuild lmcache_fs) + PR #4261 (IPC teardown) on top of merged #4693 (issue #4676 GIL hang)." \
+            --prerelease \
+            dist/*.whl
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push cu129 image
+        run: |
+          docker build \
+            -f docker/Dockerfile.server-cu129 \
+            -t "${IMAGE}:${IMAGE_TAG}" \
+            -t "${IMAGE}:${RELEASE_TAG}" \
+            .
+          docker push "${IMAGE}:${IMAGE_TAG}"
+          docker push "${IMAGE}:${RELEASE_TAG}"
+
+      - name: Summary
+        run: |
+          echo "## cu129 overlay published" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Release: https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Image: ${IMAGE}:${IMAGE_TAG}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Wheel version: ${WHEEL_VERSION}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Base: official nightly 0.5.5.dev118 cuda_ops preserved" >> "${GITHUB_STEP_SUMMARY}"
