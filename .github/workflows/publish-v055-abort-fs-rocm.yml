@@ -1,0 +1,97 @@
+name: Publish v0.5.5 abort+fs ROCm (nightly overlay)
+
+on:
+  push:
+    branches:
+      - v0.5.5-abort-fs
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  RELEASE_TAG: v0.5.5-abort-fs-overlay-rocm
+  IMAGE: ghcr.io/smurthy024/lmcache-server
+  IMAGE_TAG: v0.5.5-abort-fs-overlay-rocm
+  WHEEL_VERSION: 0.5.5.dev118+abort4136.fs4752.overlay.rocm7.2
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-and-publish:
+    name: Overlay nightly-rocm + publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/share/swift \
+            /usr/local/.ghcup
+          docker image prune -af
+          df -h /
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build deps (torch for CppExtension only; no HIP cuda_ops rebuild)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install wheel setuptools setuptools-scm numpy pybind11
+
+      - name: Build overlay wheel
+        env:
+          WHEEL_VERSION: ${{ env.WHEEL_VERSION }}
+          OUT_DIR: dist
+        run: |
+          chmod +x .github/scripts/build_nightly_overlay_rocm_wheel.sh
+          .github/scripts/build_nightly_overlay_rocm_wheel.sh
+
+      - name: Publish overlay wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "${RELEASE_TAG}" --yes 2>/dev/null || true
+          gh release create "${RELEASE_TAG}" \
+            --title "LMCache v0.5.5.dev118 abort+fs ROCm (nightly overlay)" \
+            --notes "Official nightly-rocm cp312 hipified cuda_ops kept intact. Overlay: PR #4136 (abort) + PR #4752 (fs_native/salt; rebuild lmcache_fs). Includes merged #4693 (issue #4676 GIL hang) from nightly. Does NOT include PR #4261." \
+            --prerelease \
+            dist/*.whl
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ROCm image
+        run: |
+          docker build \
+            -f docker/Dockerfile.server-rocm \
+            --build-arg BASE_IMAGE=vllm/vllm-openai-rocm:v0.27.1 \
+            -t "${IMAGE}:${IMAGE_TAG}" \
+            -t "${IMAGE}:${RELEASE_TAG}" \
+            .
+          docker push "${IMAGE}:${IMAGE_TAG}"
+          docker push "${IMAGE}:${RELEASE_TAG}"
+
+      - name: Summary
+        run: |
+          echo "## ROCm overlay published" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Release: https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Image: ${IMAGE}:${IMAGE_TAG}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Wheel version: ${WHEEL_VERSION}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Base: official nightly-rocm 0.5.5.dev118 cuda_ops (HIP) preserved (no #4261)" >> "${GITHUB_STEP_SUMMARY}"
