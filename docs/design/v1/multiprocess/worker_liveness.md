@@ -181,4 +181,60 @@ stop is already requested — a straggling cycle cannot re-create a ghost contex
 | Heartbeat thread starved, worker transferring | Store/retrieve/prepare/commit refresh `last_seen`; never reaped. |
 | Partition shorter than the reap window | No reap. On heal, the recover callback re-registers; the NOOP path refreshes `last_seen`; zero context churn. |
 | Worker crash + restart | The new process gets a fresh uuid-derived id and a fresh entry; the dead id is reaped independently. No PID-reuse aliasing. |
+| Worker crash **mid-transfer** (store/retrieve already accepted) | Reaped on schedule, but the release must not touch device work that depends on the dead worker. See §8. |
 | Mixed client/server versions | Every PING fails the payload-count check; the client sits permanently unhealthy. Loud, never silent corruption; upgrade both sides together. |
+
+## 8. Dying Mid-Transfer: the Producer-Event Wait
+
+Reaping alone does not release a worker that died with a store or retrieve in
+flight. Every LMCache-driven transfer is ordered after an interprocess event the
+worker records once the KV blocks are written; the server enqueues
+`wait_event(producer_event, stream)` and then the copies. If the worker dies
+between sending the request and recording the event, the wait can never complete.
+
+On CUDA that is a stalled stream and nothing more. On ROCm/HIP it is fatal to the
+release: the runtime implements an interprocess `streamWait` as a *host callback*
+spinning on a shared-memory flag, and while it spins every later runtime call on
+that stream, the imported event or the imported KV mapping blocks indefinitely:
+
+| call | where it hangs | effect |
+|---|---|---|
+| `hipEventDestroy` on the imported event | store handler frame exit | GPU worker thread parked holding the entry's transfer pin -> `_retire_entries` defers the release forever |
+| `hipStreamSynchronize` | `GPUCacheContext.close()` | force-release path (`_ipc_collect_cycle`) parks the IPC-collector thread |
+| `hipIpcCloseMemHandle` | torch storage deleter when the last KV tensor ref drops | blocks with the GIL held; whole server freezes |
+
+Observed 2026-09 on MI355X / ROCm 7.2: a SIGKILLed vLLM worker left ~72 GiB of KV
+pool mapped by the sidecar; the restarted engine could not allocate its KV cache
+and crash-looped until the server was restarted. Reaper, checkin timeout and
+force-release all fired on time -- none of them can complete once the doomed wait
+is on the stream. Teardown-side variants (stash the events, park the stream, let
+the deleter unmap) were tried and hang in the next call down the list.
+
+**Fix: never enqueue a wait on a producer that may die.** `producer_wait.py`
+adds a `host` wait mode: the handler thread polls `query_event` and enqueues the
+copies only once the event has fired; the poll aborts as soon as the reaper marks
+the entry `dead` (or after `producer_wait_timeout_seconds`), in which case the
+handler enqueues nothing and answers `(b"", False)` -- the same terminal response
+an unregistered instance gets. Retrieve additionally releases the lookup's
+prefetch locks. The imported/local event pair of an abandoned wait is retained
+for the process lifetime (destroying it could block). `GPUCacheContext.close()`
+bounds its drain (`context_close_drain_timeout_seconds`) and parks, rather than
+synchronizes, a stream that will not drain.
+
+```
+kill -9 worker (store in flight, event unrecorded)
+   ~30 s   reaper: "Reaped GPU instance ..." -> entry.dead = True
+   +0 ms   handler poll sees entry.dead -> "STORE ... skipped: GPU instance was
+           reaped ..." -> returns (b"", False); pin released, nothing enqueued
+   +150 ms _release_entries: close() drains instantly, refs dropped,
+           "Released 1 context(s): free device memory 216 -> 287 GiB (+71 GiB)"
+```
+
+Mode is `--producer-wait-mode {auto,device,host}`; `auto` (default) selects
+`host` on HIP and keeps the upstream `device` wait on CUDA. Cost of `host`: the
+affinity thread serving an instance is busy while that instance's event is
+pending (normally sub-millisecond); with `--max-gpu-workers` below the number of
+instances a second instance sharing the thread queues behind it. On HIP the
+runtime was already host-spinning for the same duration, so per-request latency
+is unchanged; on CUDA the stream wait is genuinely asynchronous, which is why
+`auto` leaves it alone there.

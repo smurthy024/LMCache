@@ -520,3 +520,37 @@ def test_no_double_release_when_collector_wins(monkeypatch) -> None:
     module.checkin_context_entry(entry)
     assert ctx.close.call_count == 1, "late checkin must not double-release"
     assert entry.in_use == 0
+
+
+# --- close() receives the configured drain bound -----------------------------
+
+
+def test_release_passes_default_drain_timeout_to_close(monkeypatch) -> None:
+    """The module's default drain bound (20 s) reaches cache_context.close()."""
+    dev = _FakeTorchDev()
+    monkeypatch.setattr(gpu_mod, "torch_dev", dev)
+    module = _module(monkeypatch)
+    ctx = _register(module, monkeypatch, 3)
+
+    module.unregister_kv_cache(3)
+
+    ctx.close.assert_called_once_with(drain_timeout_s=20.0)
+
+
+def test_release_passes_configured_drain_timeout_to_close(monkeypatch) -> None:
+    """A constructor-supplied drain bound is forwarded unchanged."""
+    dev = _FakeTorchDev()
+    monkeypatch.setattr(gpu_mod, "torch_dev", dev)
+    monkeypatch.setattr(gpu_mod, "DeviceHostFuncDispatcher", MagicMock())
+    monkeypatch.setattr(
+        gpu_mod, "create_periodic_thread", lambda **kw: _StoppedPeriodicThread()
+    )
+    module = LMCacheDrivenTransferModule(
+        MagicMock(name="ctx"), close_drain_timeout_s=0.0
+    )
+    ctx = _register(module, monkeypatch, 4)
+
+    module.unregister_kv_cache(4)
+
+    ctx.close.assert_called_once_with(drain_timeout_s=0.0)
+    assert dev.calls == ["empty_cache", "ipc_collect"]

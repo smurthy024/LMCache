@@ -16,6 +16,11 @@ from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 
+# Accepted values for --producer-wait-mode; mirrors
+# lmcache.v1.multiprocess.producer_wait.ProducerWaitMode (kept as plain strings
+# here so config parsing does not import torch).
+PRODUCER_WAIT_MODES: frozenset[str] = frozenset({"auto", "device", "host"})
+
 
 @dataclass
 class MPServerConfig:
@@ -127,13 +132,36 @@ class MPServerConfig:
     """List of experimental transfer modules to enable. Options: transfer_query
     (see lmcache.v1.multiprocess.modules.experimental.__init___.py)."""
 
+    producer_wait_mode: str = "auto"
+    """How LMCache-driven store/retrieve wait for the engine worker's "KV is
+    ready" IPC event: "device" enqueues the wait on the transfer stream
+    (upstream behaviour), "host" polls the event on the handler thread and
+    aborts the transfer when the worker is reaped, "auto" picks "host" on
+    ROCm/HIP and "device" elsewhere. On HIP a stream wait on an event whose
+    exporter died can never be torn down and pins the dead worker's KV pool;
+    see lmcache.v1.multiprocess.producer_wait."""
+
+    producer_wait_timeout_seconds: float = 600.0
+    """Ceiling (seconds) for a "host" producer wait while the owning worker is
+    still considered alive. Reaping aborts the wait sooner; this is a safety
+    net for a worker that keeps pinging but never records its event. 0
+    disables the ceiling."""
+
+    context_close_drain_timeout_seconds: float = 20.0
+    """Bound (seconds) on draining a released GPU context's transfer stream in
+    GPUCacheContext.close(). A stream that has not drained by then is parked
+    (never synchronized or destroyed) so the release can still unmap the
+    worker's KV pool. 0 restores the unbounded synchronize()."""
+
     def __post_init__(self) -> None:
-        """Validate the worker-reaping timeouts.
+        """Validate the worker-reaping and producer-wait settings.
 
         Raises:
             ValueError: If a timeout is non-finite, the reap timeout is
-                negative or a non-zero value below the 30 s floor, or the
-                registration grace is below the reap timeout.
+                negative or a non-zero value below the 30 s floor, the
+                registration grace is below the reap timeout, the producer
+                wait mode is unknown, or a producer-wait / drain timeout is
+                negative.
         """
         reap = self.worker_reap_timeout_seconds
         grace = self.worker_registration_grace_seconds
@@ -152,6 +180,17 @@ class MPServerConfig:
                 "worker registration grace must be >= the worker reap timeout "
                 f"({reap}s); got {grace}"
             )
+        if self.producer_wait_mode not in PRODUCER_WAIT_MODES:
+            raise ValueError(
+                "producer wait mode must be one of "
+                f"{sorted(PRODUCER_WAIT_MODES)}; got {self.producer_wait_mode!r}"
+            )
+        for name, value in (
+            ("producer wait timeout", self.producer_wait_timeout_seconds),
+            ("context close drain timeout", self.context_close_drain_timeout_seconds),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite value >= 0; got {value}")
 
 
 @dataclass
@@ -447,6 +486,34 @@ def add_mp_server_args(
         "timeout. Default is 3600.",
     )
     mp_group.add_argument(
+        "--producer-wait-mode",
+        choices=sorted(PRODUCER_WAIT_MODES),
+        default="auto",
+        help="How store/retrieve wait for the engine worker's 'KV is ready' "
+        "IPC event. 'device': enqueue the wait on the transfer stream. "
+        "'host': poll on the handler thread and abort the transfer when the "
+        "worker is reaped, so a worker that dies mid-transfer cannot pin its "
+        "KV pool (required on ROCm/HIP). 'auto' (default): 'host' on HIP, "
+        "'device' elsewhere.",
+    )
+    mp_group.add_argument(
+        "--producer-wait-timeout-seconds",
+        type=float,
+        default=600.0,
+        help="Ceiling (s) for a 'host' producer wait while the worker still "
+        "looks alive; reaping aborts it sooner. 0 disables the ceiling. "
+        "Default is 600.",
+    )
+    mp_group.add_argument(
+        "--context-close-drain-timeout-seconds",
+        type=float,
+        default=20.0,
+        help="Bound (s) on draining a released GPU context's transfer stream; "
+        "a stream that has not drained by then is parked instead of "
+        "synchronized so the worker's KV pool can still be unmapped. 0 "
+        "restores the unbounded synchronize(). Default is 20.",
+    )
+    mp_group.add_argument(
         "--enable-segmented-prefix",
         action="store_true",
         help="CacheBlend (--engine-type blend) only: on a mid-prefix L2 "
@@ -519,6 +586,9 @@ def parse_args_to_mp_server_config(
         worker_reap_timeout_seconds=args.worker_reap_timeout_seconds,
         worker_registration_grace_seconds=args.worker_registration_grace_seconds,
         enable=args.enable or [],
+        producer_wait_mode=args.producer_wait_mode,
+        producer_wait_timeout_seconds=args.producer_wait_timeout_seconds,
+        context_close_drain_timeout_seconds=args.context_close_drain_timeout_seconds,
     )
 
 

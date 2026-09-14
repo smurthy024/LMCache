@@ -367,8 +367,11 @@ class MUSACacheContext(BaseCacheContext):
             self.kv_layer_groups_manager_.kernel_groups[0].dtype,
         )
 
-    def close(self) -> None:
+    def close(self, *, drain_timeout_s: float | None = None) -> None:
         """Synchronize transfers and release receiver-side IPC owners.
+
+        ``drain_timeout_s`` is accepted for interface parity and ignored; MUSA
+        contexts synchronize without bound.
 
         Returns:
             None.
