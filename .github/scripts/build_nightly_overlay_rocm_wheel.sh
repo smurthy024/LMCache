@@ -3,20 +3,21 @@
 # nightly-rocm cp312 wheel, keeping nightly's hipified cuda_ops (and other
 # GPU-native) .so files intact. Only lmcache_fs is rebuilt from this tree
 # (needed for PR #4752 C++ key-codec / salt changes). Abort #4136 and IPC
-# #4261 are Python-only and are applied via the .py overlay.
+# #4261 and the dead-producer wait (producer_wait.py) are Python-only and
+# are applied via the .py overlay.
 #
 # Env:
 #   NIGHTLY_WHL_URL   override nightly-rocm wheel URL (default: resolve
 #                     latest cp312 asset from LMCache/LMCache nightly-rocm)
 #   WHEEL_VERSION     pretend / published version
-#                     (default 0.5.5.dev118+abort4136.fs4752.ipc4261.overlay.rocm7.2)
+#                     (default 0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay.rocm7.2)
 #   OUT_DIR           output directory for the wheel (default dist)
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
-WHEEL_VERSION="${WHEEL_VERSION:-0.5.5.dev118+abort4136.fs4752.ipc4261.overlay.rocm7.2}"
+WHEEL_VERSION="${WHEEL_VERSION:-0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay.rocm7.2}"
 OUT_DIR="${OUT_DIR:-dist}"
 
 if [[ -z "${NIGHTLY_WHL_URL:-}" ]]; then
@@ -93,13 +94,16 @@ import re, shutil
 
 pkg = Path("${PKG}")
 version = "${WHEEL_VERSION}"
+# setuptools-scm style tuple derived from the version string, e.g.
+# 0.5.5.dev118+a.b -> (0, 5, 5, 'dev118', 'a', 'b')
+version_tuple = tuple(int(p) if p.isdigit() else p for p in re.split(r"[.+]", version))
 
 ver_py = pkg / "lmcache" / "_version.py"
 text = ver_py.read_text()
 text = re.sub(r"__version__ = version = '.*'", f"__version__ = version = '{version}'", text)
 text = re.sub(
     r"__version_tuple__ = version_tuple = .*",
-    "__version_tuple__ = version_tuple = (0, 5, 5, 'dev118', 'abort4136', 'fs4752', 'ipc4261', 'overlay', 'rocm7', '2')",
+    f"__version_tuple__ = version_tuple = {version_tuple!r}",
     text,
 )
 text = re.sub(r"__commit_id__ = commit_id = .*", "__commit_id__ = commit_id = None", text)

@@ -3,12 +3,12 @@
 # nightly cp312 wheel, keeping nightly's cuda_ops (and other GPU-native) .so
 # files intact. Only lmcache_fs is rebuilt from this tree (needed for PR #4752
 # C++ key-codec / salt changes). Abort #4136 and IPC #4261 are Python-only
-# and are applied via the .py overlay.
+# and the dead-producer wait (producer_wait.py) are applied via the .py overlay.
 #
 # Env:
 #   NIGHTLY_WHL_URL   override nightly wheel URL
 #   WHEEL_VERSION     pretend / published version
-#                     (default 0.5.5.dev118+abort4136.fs4752.ipc4261.overlay)
+#                     (default 0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay)
 #   OUT_DIR           output directory for the wheel (default dist)
 set -euo pipefail
 
@@ -16,7 +16,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
 NIGHTLY_WHL_URL="${NIGHTLY_WHL_URL:-https://github.com/LMCache/LMCache/releases/download/nightly/lmcache-0.5.5.dev118-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl}"
-WHEEL_VERSION="${WHEEL_VERSION:-0.5.5.dev118+abort4136.fs4752.ipc4261.overlay}"
+WHEEL_VERSION="${WHEEL_VERSION:-0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay}"
 OUT_DIR="${OUT_DIR:-dist}"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/lmcache-overlay.XXXXXX")"
@@ -75,6 +75,9 @@ import re, shutil
 
 pkg = Path("${PKG}")
 version = "${WHEEL_VERSION}"
+# setuptools-scm style tuple derived from the version string, e.g.
+# 0.5.5.dev118+a.b -> (0, 5, 5, 'dev118', 'a', 'b')
+version_tuple = tuple(int(p) if p.isdigit() else p for p in re.split(r"[.+]", version))
 
 # Rewrite _version.py
 ver_py = pkg / "lmcache" / "_version.py"
@@ -83,7 +86,7 @@ text = re.sub(r"__version__ = version = '.*'", f"__version__ = version = '{versi
 # Keep a simple tuple for setuptools-scm style consumers.
 text = re.sub(
     r"__version_tuple__ = version_tuple = .*",
-    "__version_tuple__ = version_tuple = (0, 5, 5, 'dev118', 'abort4136', 'fs4752', 'ipc4261', 'overlay')",
+    f"__version_tuple__ = version_tuple = {version_tuple!r}",
     text,
 )
 text = re.sub(r"__commit_id__ = commit_id = .*", "__commit_id__ = commit_id = None", text)

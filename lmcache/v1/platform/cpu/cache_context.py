@@ -217,8 +217,11 @@ class CPUCacheContext(BaseCacheContext):
                 free_bytes,
             )
 
-    def close(self) -> None:
+    def close(self, *, drain_timeout_s: float | None = None) -> None:
         """Release SHM-backed tensor references.
+
+        ``drain_timeout_s`` is accepted for interface parity and ignored: CPU
+        contexts have no device stream to drain.
 
         Although CPU contexts have no GDS staging buffer, the unwrapped
         KV tensors are backed by POSIX SHM segments whose lifetime is tied

@@ -63,6 +63,7 @@ from lmcache.v1.multiprocess.modules.lookup import LookupModule
 from lmcache.v1.multiprocess.modules.management import ManagementModule
 from lmcache.v1.multiprocess.modules.p2p_controller import P2PController
 from lmcache.v1.multiprocess.mq import MessageQueueServer
+from lmcache.v1.multiprocess.producer_wait import ProducerWaitPolicy
 from lmcache.v1.multiprocess.protocol import (
     RequestType,
     get_handler_type,
@@ -173,6 +174,35 @@ def add_handler_helper(
     )
 
 
+def _lmcache_driven_module(
+    ctx: MPCacheServerContext,
+    mp_config: MPServerConfig,
+    producer_wait: ProducerWaitPolicy,
+) -> LMCacheDrivenTransferModule:
+    """Construct the LMCache-driven transfer module from the server config.
+
+    Args:
+        ctx: Shared engine context.
+        mp_config: Server configuration (drain timeout).
+        producer_wait: Resolved producer-wait policy.
+
+    Returns:
+        The configured transfer module.
+    """
+    logger.info(
+        "LMCache-driven transfer: producer wait mode=%s (timeout %.0fs), "
+        "context close drain timeout %.0fs",
+        producer_wait.mode.value,
+        producer_wait.timeout_s,
+        mp_config.context_close_drain_timeout_seconds,
+    )
+    return LMCacheDrivenTransferModule(
+        ctx,
+        producer_wait=producer_wait,
+        close_drain_timeout_s=mp_config.context_close_drain_timeout_seconds,
+    )
+
+
 def _build_modules(
     ctx: MPCacheServerContext,
     mp_config: MPServerConfig,
@@ -205,12 +235,15 @@ def _build_modules(
     # be constructed with them as liveness targets / reap listeners. They are
     # the InstanceLivenessTargets the reaper scans.
     transfer_modules: list[EngineModule] = []
+    producer_wait = ProducerWaitPolicy.from_config(
+        mp_config.producer_wait_mode, mp_config.producer_wait_timeout_seconds
+    )
     if mp_config.supported_transfer_mode == "lmcache_driven":
-        transfer_modules.append(LMCacheDrivenTransferModule(ctx))
+        transfer_modules.append(_lmcache_driven_module(ctx, mp_config, producer_wait))
     elif mp_config.supported_transfer_mode == "engine_driven":
         transfer_modules.append(EngineDrivenTransferModule(ctx))
     elif mp_config.supported_transfer_mode == "auto":
-        transfer_modules.append(LMCacheDrivenTransferModule(ctx))
+        transfer_modules.append(_lmcache_driven_module(ctx, mp_config, producer_wait))
         transfer_modules.append(EngineDrivenTransferModule(ctx))
     else:
         raise ValueError(

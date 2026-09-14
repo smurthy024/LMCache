@@ -91,8 +91,14 @@ class BaseCacheContext(ABC):
         ...
 
     @abstractmethod
-    def close(self) -> None:
-        """Release device-specific resources (GDS staging buffers, etc.)."""
+    def close(self, *, drain_timeout_s: float | None = None) -> None:
+        """Release device-specific resources (GDS staging buffers, etc.).
+
+        Args:
+            drain_timeout_s: Upper bound on waiting for in-flight device work
+                before releasing; ``None``/``0`` waits without bound. Backends
+                without a device stream ignore it.
+        """
         ...
 
     @abstractmethod

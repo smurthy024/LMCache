@@ -1,9 +1,9 @@
-name: Publish v0.5.5 abort+fs+ipc cu129 (nightly overlay)
+name: Publish v0.5.5 abort+fs+ipc+deadproducer cu129 (nightly overlay)
 
 on:
   push:
     branches:
-      - v0.5.5-abort-fs-ipc
+      - v0.5.5-abort-fs-ipc-deadproducer
   workflow_dispatch:
 
 permissions:
@@ -11,10 +11,10 @@ permissions:
   packages: write
 
 env:
-  RELEASE_TAG: v0.5.5-abort-fs-ipc-overlay-cu129
+  RELEASE_TAG: v0.5.5-abort-fs-ipc-deadproducer-overlay-cu129
   IMAGE: ghcr.io/smurthy024/lmcache-server
-  IMAGE_TAG: v0.5.5-abort-fs-ipc-overlay-cu129
-  WHEEL_VERSION: 0.5.5.dev118+abort4136.fs4752.ipc4261.overlay
+  IMAGE_TAG: v0.5.5-abort-fs-ipc-deadproducer-overlay-cu129
+  WHEEL_VERSION: 0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay
   NIGHTLY_WHL_URL: https://github.com/LMCache/LMCache/releases/download/nightly/lmcache-0.5.5.dev118-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
 
 defaults:

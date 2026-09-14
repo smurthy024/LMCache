@@ -1,9 +1,9 @@
-name: Publish v0.5.5 abort+fs+ipc ROCm (nightly overlay)
+name: Publish v0.5.5 abort+fs+ipc+deadproducer ROCm (nightly overlay)
 
 on:
   push:
     branches:
-      - v0.5.5-abort-fs-ipc
+      - v0.5.5-abort-fs-ipc-deadproducer
   workflow_dispatch:
 
 permissions:
@@ -11,10 +11,10 @@ permissions:
   packages: write
 
 env:
-  RELEASE_TAG: v0.5.5-abort-fs-ipc-overlay-rocm
+  RELEASE_TAG: v0.5.5-abort-fs-ipc-deadproducer-overlay-rocm
   IMAGE: ghcr.io/smurthy024/lmcache-server
-  IMAGE_TAG: v0.5.5-abort-fs-ipc-overlay-rocm
-  WHEEL_VERSION: 0.5.5.dev118+abort4136.fs4752.ipc4261.overlay.rocm7.2
+  IMAGE_TAG: v0.5.5-abort-fs-ipc-deadproducer-overlay-rocm
+  WHEEL_VERSION: 0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay.rocm7.2
 
 defaults:
   run:

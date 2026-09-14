@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from itertools import islice
 from typing import Any, Generator, Sequence
 import functools
+import gc
 import threading
 import time
 
@@ -48,6 +49,13 @@ from lmcache.v1.multiprocess.modules.lookup import resolve_prefetched_obj_keys
 from lmcache.v1.multiprocess.native_completion import (
     DeviceHostFuncDispatcher,
     submit_callback_to_stream,
+)
+from lmcache.v1.multiprocess.producer_wait import (
+    AbandonedEventRegistry,
+    ProducerWaitMode,
+    ProducerWaitOutcome,
+    ProducerWaitPolicy,
+    wait_for_producer_event,
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
@@ -94,6 +102,17 @@ _CHECKIN_TIMEOUT_S = 120.0
 _HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = hasattr(
     device_ops, "execute_object_group_transfer"
 )
+
+
+def _free_device_memory_bytes() -> int | None:
+    """Return free device memory in bytes, or None if the backend cannot say."""
+    mem_get_info = getattr(torch_dev, "mem_get_info", None)
+    if mem_get_info is None:
+        return None
+    try:
+        return int(mem_get_info()[0])
+    except Exception:
+        return None
 
 
 def get_layout_desc(
@@ -714,10 +733,29 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     Args:
         ctx: The shared engine context.
+        producer_wait: How store/retrieve wait for the worker's "KV is ready"
+            event. Defaults to the ``auto`` policy (host-side wait on
+            ROCm/HIP, stream wait elsewhere); see
+            :mod:`lmcache.v1.multiprocess.producer_wait`.
+        close_drain_timeout_s: Bound on draining a released context's stream
+            in ``cache_context.close()``; ``0`` means unbounded.
     """
 
-    def __init__(self, ctx: MPCacheServerContext) -> None:
+    def __init__(
+        self,
+        ctx: MPCacheServerContext,
+        *,
+        producer_wait: ProducerWaitPolicy | None = None,
+        close_drain_timeout_s: float = 20.0,
+    ) -> None:
         self._ctx = ctx
+        self._producer_wait = (
+            producer_wait if producer_wait is not None else ProducerWaitPolicy.default()
+        )
+        self._close_drain_timeout_s = close_drain_timeout_s
+        # Events of producers that died mid-transfer; kept alive for the
+        # process lifetime because destroying them can block on HIP.
+        self._abandoned_events = AbandonedEventRegistry()
         self._cache_contexts: dict[int, ContextEntry] = {}
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
@@ -1015,8 +1053,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """
         if not entries:
             return
+        num_entries = len(entries)
+        free_before = _free_device_memory_bytes()
         for entry in entries:
-            entry.cache_context.close()
+            entry.cache_context.close(drain_timeout_s=self._close_drain_timeout_s)
             self._ctx.layout_desc_registry.unregister(
                 entry.model_name, entry.world_size
             )
@@ -1024,11 +1064,25 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         entries.clear()
         # ipc_collect() only unmaps a CUDA-IPC-imported segment once its last
         # tensor reference is gone (LMCache#4014), hence the clear() above.
+        # A full gc pass first: the context holds CuPy ExternalStream / tensor
+        # refcycles (#4261) that plain refcounting does not break, and a
+        # cycle-held KV tensor keeps the worker's pool mapped.
+        gc.collect()
         torch_dev.empty_cache()
         ipc_collect = getattr(torch_dev, "ipc_collect", None)
         if ipc_collect is not None:
             # Backends without IPC collection omit this optional operation.
             ipc_collect()
+        free_after = _free_device_memory_bytes()
+        if free_before is not None and free_after is not None:
+            logger.info(
+                "Released %d context(s): free device memory %.2f -> %.2f GiB "
+                "(%+.2f GiB)",
+                num_entries,
+                free_before / 2**30,
+                free_after / 2**30,
+                (free_after - free_before) / 2**30,
+            )
 
     def _ipc_collect_cycle(self) -> ThreadRunSummary:
         """Periodic IPC handle reclamation and dead-entry timeout sweep.
@@ -1354,6 +1408,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             committed (logged at WARNING); a subsequent retrieve simply misses
             and the engine recomputes. The boolean result reports whether the
             store completed without such a failure.
+
+            In ``host`` producer-wait mode (default on ROCm/HIP) the store is
+            also skipped, with an empty event handle, when the worker is
+            reaped before its producer event fires; nothing is enqueued.
         """
         st = time.perf_counter()
 
@@ -1440,7 +1498,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             producer_event = event_backend.import_event(
                 event_ipc_handle, cache_context.device
             )
-            event_backend.wait_event(producer_event, cache_context.stream)
+            if not self._wait_for_producer(
+                entry,
+                producer_event,
+                event,
+                event_backend,
+                cache_context,
+                key,
+                "STORE",
+            ):
+                # Nothing was enqueued: no completion event, terminal False.
+                return b"", False
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
             # Must be published via publish() (not publish_on_stream) so the
@@ -1597,6 +1665,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
         Raises:
             RuntimeError: If the backend does not support IPC event handles.
+
+        Notes:
+            In ``host`` producer-wait mode (default on ROCm/HIP) the retrieve
+            returns ``(b"", False)`` without enqueuing anything, and releases
+            the lookup's prefetch locks, when the worker is reaped before its
+            producer event fires.
         """
         st = time.perf_counter()
 
@@ -1699,7 +1773,42 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             producer_event = event_backend.import_event(
                 event_ipc_handle, cache_context.device
             )
-            event_backend.wait_event(producer_event, cache_context.stream)
+            if not self._wait_for_producer(
+                entry,
+                producer_event,
+                event,
+                event_backend,
+                cache_context,
+                key,
+                "RETRIEVE",
+            ):
+                # Nothing was enqueued. Release the locks the lookup's prefetch
+                # took for this request and close the observability span that
+                # MP_RETRIEVE_SUBMITTED opened above.
+                try:
+                    self._release_failed_retrieve_locks(key, instance_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to release RETRIEVE locks after abandoning the "
+                        "producer wait for GPU instance ID %d",
+                        instance_id,
+                    )
+                self._ctx.event_bus.publish(
+                    Event(
+                        event_type=EventType.MP_RETRIEVE_END,
+                        session_id=key.request_id,
+                        metadata={
+                            "retrieved_count": 0,
+                            "device": str(cache_context.device),
+                            "engine_id": instance_id,
+                            "model_name": model_name,
+                            "cache_salt": key.cache_salt,
+                            "total_bytes": 0,
+                            "num_tokens": 0,
+                        },
+                    )
+                )
+                return b"", False
 
             # Per object group, the prefetch only locked the in-window suffix
             # (the last ``num_chunks_in_sw`` chunks; the whole prefix for full
@@ -1858,3 +1967,71 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 },
             )
         )
+
+    def _wait_for_producer(
+        self,
+        entry: ContextEntry,
+        producer_event: object,
+        completion_event: object,
+        event_backend: EventIPCBackend,
+        cache_context: BaseCacheContext,
+        key: IPCCacheServerKey,
+        op: str,
+    ) -> bool:
+        """Order the upcoming transfer after the worker's producer event.
+
+        In ``DEVICE`` mode this enqueues the wait on the context stream and
+        returns immediately. In ``HOST`` mode it polls the event on this
+        thread and returns False -- without enqueuing anything -- if the
+        owning worker is reaped first or the ceiling elapses; the caller then
+        answers the request with an empty completion handle and ``False``.
+
+        Args:
+            entry: The pinned context entry (its ``dead`` flag aborts the wait).
+            producer_event: The imported producer event.
+            completion_event: This transfer's own, not-yet-recorded event.
+            event_backend: Event backend for the context's device.
+            cache_context: The worker's cache context.
+            key: The request key (for logging).
+            op: ``"STORE"`` or ``"RETRIEVE"`` (for logging).
+
+        Returns:
+            True if the transfer may be enqueued, False if it must be skipped.
+        """
+        if self._producer_wait.mode is ProducerWaitMode.DEVICE:
+            event_backend.wait_event(producer_event, cache_context.stream)
+            return True
+
+        started = time.perf_counter()
+        outcome = wait_for_producer_event(
+            event_backend,
+            producer_event,
+            producer_is_dead=lambda: entry.dead,
+            timeout_s=self._producer_wait.timeout_s,
+        )
+        if outcome is ProducerWaitOutcome.READY:
+            return True
+
+        waited_s = time.perf_counter() - started
+        if outcome is ProducerWaitOutcome.PRODUCER_DEAD:
+            logger.warning(
+                "%s for request_id=%s skipped: GPU instance was reaped %.1fs "
+                "into the wait for its producer event; nothing was enqueued",
+                op,
+                key.request_id,
+                waited_s,
+            )
+        else:
+            logger.warning(
+                "%s for request_id=%s skipped: producer event not signaled "
+                "within %.0fs while the instance still looks alive; nothing "
+                "was enqueued",
+                op,
+                key.request_id,
+                waited_s,
+            )
+        # Neither event may be destroyed now: the imported one belongs to a
+        # producer that will never signal it (hipEventDestroy would block),
+        # and the local one is kept with it so the pair's lifetime is simple.
+        self._abandoned_events.retain(producer_event, completion_event)
+        return False
