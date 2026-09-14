@@ -8,9 +8,10 @@ This module provides GPU-side KV cache management functionality, including:
 """
 
 # Standard
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 import array
+import time
 
 # Third Party
 import torch
@@ -339,6 +340,46 @@ class _TempGPUBuffer:
         )
 
 
+# Streams (and the GPU buffers their queued work references) of released
+# contexts that never drained. Kept for the process lifetime: synchronizing
+# or destroying such a stream blocks forever on HIP. See GPUCacheContext.close.
+_PARKED_CONTEXT_RESOURCES: list[tuple[Any, ...]] = []
+
+# Poll interval while waiting for a stream to drain in close().
+_DRAIN_POLL_S = 0.01
+
+
+def drain_stream(
+    stream: Any,
+    timeout_s: float | None,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Wait for ``stream`` to finish its queued work, with an optional bound.
+
+    Args:
+        stream: A torch stream exposing ``synchronize()`` and ``query()``.
+        timeout_s: ``None`` or ``0`` synchronizes without bound; a positive
+            value polls ``query()`` for at most that many seconds.
+        clock: Monotonic clock (injectable for tests).
+        sleep: Sleep function (injectable for tests).
+
+    Returns:
+        True if the stream drained, False if the bound elapsed first.
+    """
+    if not timeout_s:
+        stream.synchronize()
+        return True
+    start = clock()
+    while True:
+        if stream.query():
+            return True
+        if clock() - start > timeout_s:
+            return False
+        sleep(_DRAIN_POLL_S)
+
+
 class GPUCacheContext(BaseCacheContext):
     """
     Manages the shape and pointers to vLLM GPU KV cache tensors.
@@ -369,6 +410,7 @@ class GPUCacheContext(BaseCacheContext):
                 engine_type,
                 separate_object_groups,
                 full_sw_kv,
+                max_batch_size,
             )
         except BaseException:
             # Partial construction may have imported some mappings
@@ -386,6 +428,7 @@ class GPUCacheContext(BaseCacheContext):
         engine_type: EngineType,
         separate_object_groups: bool,
         full_sw_kv: bool,
+        max_batch_size: int,
     ) -> None:
         """Body of ``__init__``; split out so the constructor can roll
         back partially imported KV mappings on failure.
@@ -467,20 +510,56 @@ class GPUCacheContext(BaseCacheContext):
             logger,
         )
 
-    def close(self) -> None:
+    def close(self, *, drain_timeout_s: float | None = None) -> None:
         """Drain the stream, close IPC wrappers, and drop CuPy/stream refs.
 
         Combines #4693 (synchronize before unmap so we don't hold the GIL
         forever in wrapper.close) with #4261 (null CuPy ExternalStream /
         tensor refs so IPC handles are not pinned by a refcycle / disabled GC).
+
+        Args:
+            drain_timeout_s: Upper bound on waiting for the transfer stream to
+                drain. ``None`` or ``0`` synchronizes without bound (upstream
+                behaviour). With a positive bound, a stream that is still busy
+                afterwards is *parked* -- kept alive together with the GPU
+                buffers its queued work references -- instead of synchronized,
+                and the release continues so the imported KV pool can still be
+                unmapped. A stream only fails to drain when its queued work
+                depends on a producer that will never signal (worker died
+                mid-transfer); synchronizing on it would block this thread
+                forever, as would destroying it.
         """
         # 1. Drain in-flight work on this context's stream (#4693 / #4676).
+        drained = True
         if self.cuda_stream_ is not None:
-            self.cuda_stream_.synchronize()
+            drained = drain_stream(self.cuda_stream_, drain_timeout_s)
+            if not drained:
+                _PARKED_CONTEXT_RESOURCES.append(
+                    (
+                        self.cuda_stream_,
+                        self.cupy_stream_,
+                        self._temp_buffer,
+                        self.block_ids_buffer_,
+                        self.group_kv_pointers_,
+                    )
+                )
+                logger.warning(
+                    "GPUCacheContext.close: stream on %s did not drain within "
+                    "%.0fs; parking it with its staging buffers (%d parked so "
+                    "far) and continuing the release",
+                    self.device_,
+                    drain_timeout_s or 0.0,
+                    len(_PARKED_CONTEXT_RESOURCES),
+                )
 
-        # 2. Deregister the GDS staging buffer (reverse of __init__).
+        # 2. Deregister the GDS staging buffer (reverse of __init__). Skipped
+        #    for a parked stream: the buffer stays registered and alive.
         try:
-            if self.cuda_stream_ is not None and self._temp_buffer is not None:
+            if (
+                drained
+                and self.cuda_stream_ is not None
+                and self._temp_buffer is not None
+            ):
                 with torch_dev.stream(self.cuda_stream_):
                     get_gds_context().deregister_gpu_buffer(self._temp_buffer.buffer)
         except Exception as e:

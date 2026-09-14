@@ -390,3 +390,54 @@ def test_deprecated_flags_log_warning():
 def test_deprecated_flush_interval_flag_rejects_nonpositive():
     with pytest.raises(ValueError):
         _parse(["--coordinator-l2-event-flush-interval", "0"])
+
+
+# -- Producer wait / context close drain --------------------------------------
+
+
+def test_producer_wait_defaults():
+    cfg = _parse_mp([])
+    assert cfg.producer_wait_mode == "auto"
+    assert cfg.producer_wait_timeout_seconds == 600.0
+    assert cfg.context_close_drain_timeout_seconds == 20.0
+    assert MPServerConfig().producer_wait_mode == "auto"
+
+
+@pytest.mark.parametrize("mode", ["auto", "device", "host"])
+def test_producer_wait_mode_flag_is_parsed(mode):
+    assert _parse_mp(["--producer-wait-mode", mode]).producer_wait_mode == mode
+
+
+def test_producer_wait_mode_rejects_unknown_flag_value():
+    with pytest.raises(SystemExit):
+        _parse_mp(["--producer-wait-mode", "spin"])
+
+
+def test_producer_wait_mode_rejects_unknown_dataclass_value():
+    with pytest.raises(ValueError, match="producer wait mode"):
+        MPServerConfig(producer_wait_mode="spin")
+
+
+def test_producer_wait_timeout_flags_are_parsed():
+    cfg = _parse_mp(
+        [
+            "--producer-wait-timeout-seconds",
+            "0",
+            "--context-close-drain-timeout-seconds",
+            "5.5",
+        ]
+    )
+    assert cfg.producer_wait_timeout_seconds == 0.0
+    assert cfg.context_close_drain_timeout_seconds == 5.5
+
+
+@pytest.mark.parametrize("value", [-1.0, float("inf"), float("nan")])
+def test_producer_wait_timeout_rejects_invalid(value):
+    with pytest.raises(ValueError, match="producer wait timeout"):
+        MPServerConfig(producer_wait_timeout_seconds=value)
+
+
+@pytest.mark.parametrize("value", [-0.1, float("inf")])
+def test_context_close_drain_timeout_rejects_invalid(value):
+    with pytest.raises(ValueError, match="context close drain timeout"):
+        MPServerConfig(context_close_drain_timeout_seconds=value)
