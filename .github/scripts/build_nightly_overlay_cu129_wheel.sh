@@ -15,7 +15,10 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
-NIGHTLY_WHL_URL="${NIGHTLY_WHL_URL:-https://github.com/LMCache/LMCache/releases/download/nightly/lmcache-0.5.5.dev118-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl}"
+# Default base: our Sep-10 overlay release, which preserves the official
+# 0.5.5.dev118 GPU-native .so files. Upstream's `nightly` tag rotates assets,
+# so the original nightly URL is no longer stable.
+NIGHTLY_WHL_URL="${NIGHTLY_WHL_URL:-https://github.com/smurthy024/LMCache/releases/download/v0.5.5-abort-fs-ipc-overlay-cu129/lmcache-0.5.5.dev118%2Babort4136.fs4752.ipc4261.overlay-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl}"
 WHEEL_VERSION="${WHEEL_VERSION:-0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay}"
 OUT_DIR="${OUT_DIR:-dist}"
 

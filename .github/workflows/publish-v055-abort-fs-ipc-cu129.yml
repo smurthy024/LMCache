@@ -15,7 +15,12 @@ env:
   IMAGE: ghcr.io/smurthy024/lmcache-server
   IMAGE_TAG: v0.5.5-abort-fs-ipc-deadproducer-overlay-cu129
   WHEEL_VERSION: 0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay
-  NIGHTLY_WHL_URL: https://github.com/LMCache/LMCache/releases/download/nightly/lmcache-0.5.5.dev118-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+  # Upstream's `nightly` tag rotates its assets (0.5.5.dev118 was replaced by
+  # 0.5.6.dev6 on 2026-09-14 and the old URL now 404s -> curl exit 22). Pin to
+  # our own Sep-10 overlay release instead: it carries the official dev118
+  # cuda_ops/lmcache_native/lmcache_redis .so untouched, and the overlay
+  # script re-applies this branch's .py and rebuilds lmcache_fs on top.
+  NIGHTLY_WHL_URL: https://github.com/smurthy024/LMCache/releases/download/v0.5.5-abort-fs-ipc-overlay-cu129/lmcache-0.5.5.dev118%2Babort4136.fs4752.ipc4261.overlay-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
 
 defaults:
   run:
