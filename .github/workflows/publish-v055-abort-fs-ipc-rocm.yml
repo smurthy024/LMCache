@@ -15,6 +15,13 @@ env:
   IMAGE: ghcr.io/smurthy024/lmcache-server
   IMAGE_TAG: v0.5.5-abort-fs-ipc-deadproducer-overlay-rocm
   WHEEL_VERSION: 0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay.rocm7.2
+  # Pin the base wheel. Upstream's `nightly-rocm` tag rotates its assets (it
+  # moved to 0.5.6.dev6 on 2026-09-14), so resolving "latest" silently changes
+  # the GPU-native .so files under a 0.5.5.dev118 label. Our Sep-10 overlay
+  # release carries the official dev118 hipified cuda_ops/lmcache_native/
+  # lmcache_redis untouched; the overlay script re-applies this branch's .py
+  # and rebuilds lmcache_fs on top.
+  NIGHTLY_WHL_URL: https://github.com/smurthy024/LMCache/releases/download/v0.5.5-abort-fs-ipc-overlay-rocm/lmcache-0.5.5.dev118%2Babort4136.fs4752.ipc4261.overlay.rocm7.2-cp312-cp312-manylinux_2_35_x86_64.whl
 
 defaults:
   run:
@@ -53,6 +60,7 @@ jobs:
 
       - name: Build overlay wheel
         env:
+          NIGHTLY_WHL_URL: ${{ env.NIGHTLY_WHL_URL }}
           WHEEL_VERSION: ${{ env.WHEEL_VERSION }}
           OUT_DIR: dist
         run: |

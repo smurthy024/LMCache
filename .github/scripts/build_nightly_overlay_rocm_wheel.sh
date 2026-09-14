@@ -7,8 +7,8 @@
 # are applied via the .py overlay.
 #
 # Env:
-#   NIGHTLY_WHL_URL   override nightly-rocm wheel URL (default: resolve
-#                     latest cp312 asset from LMCache/LMCache nightly-rocm)
+#   NIGHTLY_WHL_URL   override base wheel URL (default: pinned dev118 overlay
+#                     release on smurthy024/LMCache, see below)
 #   WHEEL_VERSION     pretend / published version
 #                     (default 0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay.rocm7.2)
 #   OUT_DIR           output directory for the wheel (default dist)
@@ -20,24 +20,11 @@ cd "${ROOT}"
 WHEEL_VERSION="${WHEEL_VERSION:-0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay.rocm7.2}"
 OUT_DIR="${OUT_DIR:-dist}"
 
-if [[ -z "${NIGHTLY_WHL_URL:-}" ]]; then
-  echo "==> resolving latest cp312 asset from LMCache nightly-rocm"
-  NIGHTLY_WHL_URL="$(python3 - <<'PY'
-import json, urllib.request
-url = "https://api.github.com/repos/LMCache/LMCache/releases/tags/nightly-rocm"
-with urllib.request.urlopen(url) as resp:
-    data = json.load(resp)
-assets = [
-    a for a in data.get("assets", [])
-    if a["name"].endswith(".whl") and "cp312" in a["name"]
-]
-if not assets:
-    raise SystemExit("no cp312 wheel on nightly-rocm release")
-# Prefer the single cp312 asset; if multiple, take the first.
-print(assets[0]["browser_download_url"])
-PY
-)"
-fi
+# Default base: our Sep-10 overlay release, which preserves the official
+# 0.5.5.dev118 hipified GPU-native .so files. Upstream's `nightly-rocm` tag
+# rotates assets (it became 0.5.6.dev6 on 2026-09-14), so resolving "latest"
+# would silently swap the native ABI under a dev118 label.
+NIGHTLY_WHL_URL="${NIGHTLY_WHL_URL:-https://github.com/smurthy024/LMCache/releases/download/v0.5.5-abort-fs-ipc-overlay-rocm/lmcache-0.5.5.dev118%2Babort4136.fs4752.ipc4261.overlay.rocm7.2-cp312-cp312-manylinux_2_35_x86_64.whl}"
 echo "    NIGHTLY_WHL_URL=${NIGHTLY_WHL_URL}"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/lmcache-overlay-rocm.XXXXXX")"
