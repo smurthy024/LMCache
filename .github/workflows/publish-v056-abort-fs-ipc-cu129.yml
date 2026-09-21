@@ -1,9 +1,9 @@
-name: Publish v0.5.5 abort+fs+ipc+deadproducer ROCm (nightly overlay)
+name: Publish v0.5.6.dev58 abort+fs+ipc+deadprod cu129 (nightly overlay)
 
 on:
   push:
     branches:
-      - v0.5.5-abort-fs-ipc-deadproducer
+      - v0.5.6.dev58-abort-fs-ipc-deadprod
   workflow_dispatch:
 
 permissions:
@@ -11,10 +11,11 @@ permissions:
   packages: write
 
 env:
-  RELEASE_TAG: v0.5.5-abort-fs-ipc-deadproducer-overlay-rocm
+  RELEASE_TAG: v0.5.6.dev58-abort-fs-ipc-deadprod-overlay-cu129
   IMAGE: ghcr.io/smurthy024/lmcache-server
-  IMAGE_TAG: v0.5.5-abort-fs-ipc-deadproducer-overlay-rocm
-  WHEEL_VERSION: 0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay.rocm7.2
+  IMAGE_TAG: v0.5.6.dev58-abort-fs-ipc-deadprod-overlay-cu129
+  WHEEL_VERSION: 0.5.6.dev58+abort4136.fs4752.ipc4261.deadprod.overlay
+  NIGHTLY_WHL_URL: https://github.com/LMCache/LMCache/releases/download/nightly/lmcache-0.5.6.dev58-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
 
 defaults:
   run:
@@ -22,7 +23,7 @@ defaults:
 
 jobs:
   build-and-publish:
-    name: Overlay nightly-rocm + publish
+    name: Overlay nightly + publish cu129
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +46,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install build deps (torch for CppExtension only; no HIP cuda_ops rebuild)
+      - name: Install build deps (torch for CppExtension only; no cuda_ops rebuild)
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -53,11 +54,12 @@ jobs:
 
       - name: Build overlay wheel
         env:
+          NIGHTLY_WHL_URL: ${{ env.NIGHTLY_WHL_URL }}
           WHEEL_VERSION: ${{ env.WHEEL_VERSION }}
           OUT_DIR: dist
         run: |
-          chmod +x .github/scripts/build_nightly_overlay_rocm_wheel.sh
-          .github/scripts/build_nightly_overlay_rocm_wheel.sh
+          chmod +x .github/scripts/build_nightly_overlay_cu129_wheel.sh
+          .github/scripts/build_nightly_overlay_cu129_wheel.sh
 
       - name: Publish overlay wheel
         env:
@@ -65,8 +67,8 @@ jobs:
         run: |
           gh release delete "${RELEASE_TAG}" --yes 2>/dev/null || true
           gh release create "${RELEASE_TAG}" \
-            --title "LMCache v0.5.5.dev118 abort+fs+ipc ROCm (nightly overlay)" \
-            --notes "Official nightly-rocm cp312 hipified cuda_ops kept intact. Overlay: PR #4136 (abort) + PR #4752 (fs_native/salt; rebuild lmcache_fs) + PR #4261 (IPC teardown) on top of merged #4693 (issue #4676 GIL hang)." \
+            --title "LMCache v0.5.6.dev58 abort+fs+ipc+deadprod cu129 (nightly overlay)" \
+            --notes "Official nightly 0.5.6.dev58 cp312 cuda_ops kept intact. Overlay: PR #4939 (abort; #4136 rebase) + PR #4752 (fs_native/salt; rebuild lmcache_fs) + PR #4261 (IPC teardown) + deadprod producer-wait/drain-close. #4693/#5042 already in nightly." \
             --prerelease \
             dist/*.whl
 
@@ -77,11 +79,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push ROCm image
+      - name: Build and push cu129 image
         run: |
           docker build \
-            -f docker/Dockerfile.server-rocm \
-            --build-arg BASE_IMAGE=vllm/vllm-openai-rocm:v0.27.1 \
+            -f docker/Dockerfile.server-cu129 \
             -t "${IMAGE}:${IMAGE_TAG}" \
             -t "${IMAGE}:${RELEASE_TAG}" \
             .
@@ -90,8 +91,8 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## ROCm overlay published" >> "${GITHUB_STEP_SUMMARY}"
+          echo "## cu129 overlay published" >> "${GITHUB_STEP_SUMMARY}"
           echo "- Release: https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}" >> "${GITHUB_STEP_SUMMARY}"
           echo "- Image: ${IMAGE}:${IMAGE_TAG}" >> "${GITHUB_STEP_SUMMARY}"
           echo "- Wheel version: ${WHEEL_VERSION}" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- Base: official nightly-rocm 0.5.5.dev118 cuda_ops (HIP) preserved" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Base: official nightly 0.5.6.dev58 cuda_ops preserved" >> "${GITHUB_STEP_SUMMARY}"

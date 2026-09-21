@@ -2,7 +2,7 @@
 # Build an LMCache ROCm wheel by overlaying this checkout onto the official
 # nightly-rocm cp312 wheel, keeping nightly's hipified cuda_ops (and other
 # GPU-native) .so files intact. Only lmcache_fs is rebuilt from this tree
-# (needed for PR #4752 C++ key-codec / salt changes). Abort #4136 and IPC
+# (needed for PR #4752 C++ key-codec / salt changes). Abort #4939 (#4136 rebase) and IPC
 # #4261 and the dead-producer wait (producer_wait.py) are Python-only and
 # are applied via the .py overlay.
 #
@@ -10,34 +10,17 @@
 #   NIGHTLY_WHL_URL   override nightly-rocm wheel URL (default: resolve
 #                     latest cp312 asset from LMCache/LMCache nightly-rocm)
 #   WHEEL_VERSION     pretend / published version
-#                     (default 0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay.rocm7.2)
+#                     (default 0.5.6.dev58+abort4136.fs4752.ipc4261.deadprod.overlay.rocm7.2)
 #   OUT_DIR           output directory for the wheel (default dist)
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
-WHEEL_VERSION="${WHEEL_VERSION:-0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay.rocm7.2}"
+WHEEL_VERSION="${WHEEL_VERSION:-0.5.6.dev58+abort4136.fs4752.ipc4261.deadprod.overlay.rocm7.2}"
 OUT_DIR="${OUT_DIR:-dist}"
 
-if [[ -z "${NIGHTLY_WHL_URL:-}" ]]; then
-  echo "==> resolving latest cp312 asset from LMCache nightly-rocm"
-  NIGHTLY_WHL_URL="$(python3 - <<'PY'
-import json, urllib.request
-url = "https://api.github.com/repos/LMCache/LMCache/releases/tags/nightly-rocm"
-with urllib.request.urlopen(url) as resp:
-    data = json.load(resp)
-assets = [
-    a for a in data.get("assets", [])
-    if a["name"].endswith(".whl") and "cp312" in a["name"]
-]
-if not assets:
-    raise SystemExit("no cp312 wheel on nightly-rocm release")
-# Prefer the single cp312 asset; if multiple, take the first.
-print(assets[0]["browser_download_url"])
-PY
-)"
-fi
+NIGHTLY_WHL_URL="${NIGHTLY_WHL_URL:-https://github.com/LMCache/LMCache/releases/download/nightly-rocm/lmcache-0.5.6.dev58%2Brocm7.2-cp312-cp312-manylinux_2_35_x86_64.whl}"
 echo "    NIGHTLY_WHL_URL=${NIGHTLY_WHL_URL}"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/lmcache-overlay-rocm.XXXXXX")"

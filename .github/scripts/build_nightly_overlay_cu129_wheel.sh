@@ -2,21 +2,21 @@
 # Build an LMCache cu129 wheel by overlaying this checkout onto the official
 # nightly cp312 wheel, keeping nightly's cuda_ops (and other GPU-native) .so
 # files intact. Only lmcache_fs is rebuilt from this tree (needed for PR #4752
-# C++ key-codec / salt changes). Abort #4136 and IPC #4261 are Python-only
+# C++ key-codec / salt changes). Abort #4939 (#4136 rebase) and IPC #4261 are Python-only
 # and the dead-producer wait (producer_wait.py) are applied via the .py overlay.
 #
 # Env:
 #   NIGHTLY_WHL_URL   override nightly wheel URL
 #   WHEEL_VERSION     pretend / published version
-#                     (default 0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay)
+#                     (default 0.5.6.dev58+abort4136.fs4752.ipc4261.deadprod.overlay)
 #   OUT_DIR           output directory for the wheel (default dist)
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
-NIGHTLY_WHL_URL="${NIGHTLY_WHL_URL:-https://github.com/LMCache/LMCache/releases/download/nightly/lmcache-0.5.5.dev118-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl}"
-WHEEL_VERSION="${WHEEL_VERSION:-0.5.5.dev118+abort4136.fs4752.ipc4261.deadprod.overlay}"
+NIGHTLY_WHL_URL="${NIGHTLY_WHL_URL:-https://github.com/LMCache/LMCache/releases/download/nightly/lmcache-0.5.6.dev58-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl}"
+WHEEL_VERSION="${WHEEL_VERSION:-0.5.6.dev58+abort4136.fs4752.ipc4261.deadprod.overlay}"
 OUT_DIR="${OUT_DIR:-dist}"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/lmcache-overlay.XXXXXX")"
