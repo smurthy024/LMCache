@@ -15,7 +15,13 @@ env:
   IMAGE: ghcr.io/smurthy024/lmcache-server
   IMAGE_TAG: v0.5.6.dev58-abort-fs-ipc-deadprod-hmarecv-overlay-rocm
   WHEEL_VERSION: 0.5.6.dev58+abort4136.fs4752.ipc4261.deadprod.hmarecv.overlay.rocm7.2
-  NIGHTLY_WHL_URL: https://github.com/LMCache/LMCache/releases/download/nightly-rocm/lmcache-0.5.6.dev58%2Brocm7.2-cp312-cp312-manylinux_2_35_x86_64.whl
+  # Base on our own published dev58 overlay wheel, NOT upstream's nightly-rocm
+  # tag. That tag is a rolling pointer: it moved dev58 -> dev75 on 2026-09-23,
+  # so the old pinned URL now 404s and the build dies in curl -fsSL. Our
+  # release is immutable and still carries the dev58 hipified cuda_ops, which
+  # also keeps this image a clean A/B against what production runs today --
+  # only the failed_recving change differs.
+  NIGHTLY_WHL_URL: https://github.com/smurthy024/LMCache/releases/download/v0.5.6.dev58-abort-fs-ipc-deadprod-overlay-rocm/lmcache-0.5.6.dev58%2Babort4136.fs4752.ipc4261.deadprod.overlay.rocm7.2-cp312-cp312-manylinux_2_35_x86_64.whl
 
 defaults:
   run:
@@ -68,7 +74,7 @@ jobs:
           gh release delete "${RELEASE_TAG}" --yes 2>/dev/null || true
           gh release create "${RELEASE_TAG}" \
             --title "LMCache v0.5.6.dev58 abort+fs+ipc+deadprod+hmarecv ROCm (nightly overlay)" \
-            --notes "Adds request-level KV load-failure reporting (KVConnectorTransferResults.failed_recving) so hybrid/multi-group KV layouts recover via kv_load_failure_policy=recompute instead of raising in scheduler._handle_invalid_blocks. On top of: PR #4939 (abort; #4136 rebase) + PR #4752 (fs_native/salt) + PR #4261 (IPC teardown) + deadprod producer-wait/drain-close."
+            --notes "Adds request-level KV load-failure reporting (KVConnectorTransferResults.failed_recving) so hybrid/multi-group KV layouts recover via kv_load_failure_policy=recompute instead of raising in scheduler._handle_invalid_blocks. On top of: PR #4939 (abort; #4136 rebase) + PR #4752 (fs_native/salt) + PR #4261 (IPC teardown) + deadprod producer-wait/drain-close." \
             --prerelease \
             dist/*.whl
 
