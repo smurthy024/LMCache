@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol
 import enum
@@ -1399,6 +1399,16 @@ class LMCacheMPWorkerAdapter:
         # Block IDs that failed due to retrieve timeout
         self.error_block_ids: set[int] = set()
 
+        # Under a hybrid/multi-group KV layout the scheduler tracks a single
+        # merged group while block IDs are only unique *within* a group, so a
+        # flat block-level failure report is ambiguous by construction and
+        # vLLM raises rather than guess (scheduler._handle_invalid_blocks).
+        # In that case failures are reported per request instead, via
+        # KVConnectorTransferResults.failed_recving, which the scheduler can
+        # recover from with kv_load_failure_policy='recompute'.
+        self._is_hma_required: bool = False
+        self._failed_recv_reqs: set[str] = set()
+
         # Retrieve request ids dropped by the unhealthy early-return of
         # submit_retrieve_request. get_finished must still report each id
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
@@ -1836,7 +1846,7 @@ class LMCacheMPWorkerAdapter:
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
-            self.error_block_ids.update(op.flat_block_ids)
+            self._report_load_error(request_id, op.flat_block_ids)
             self._dropped_retrieves.add(request_id)
             return
 
@@ -2037,7 +2047,7 @@ class LMCacheMPWorkerAdapter:
                 r_block_ids,
             ) in self.retrieve_futures.items():
                 finished_retrieves.add(request_id)
-                self.error_block_ids.update(r_block_ids)
+                self._report_load_error(request_id, r_block_ids)
             self.store_futures.clear()
             self.retrieve_futures.clear()
             self.store_events.clear()
@@ -2095,7 +2105,7 @@ class LMCacheMPWorkerAdapter:
             finished_retrieves.add(request_id)
 
             if not r_result:
-                self.error_block_ids.update(r_block_ids)
+                self._report_load_error(request_id, r_block_ids)
                 logger.error(
                     "Something went wrong when processing the "
                     "retrieve request for request_id=%s, result=%s",
@@ -2183,7 +2193,7 @@ class LMCacheMPWorkerAdapter:
                 r_block_ids,
             ) in self.retrieve_futures.items():
                 finished_retrieves.add(request_id)
-                self.error_block_ids.update(r_block_ids)
+                self._report_load_error(request_id, r_block_ids)
             self.store_futures.clear()
             self.retrieve_futures.clear()
             self.store_events.clear()
@@ -2234,7 +2244,7 @@ class LMCacheMPWorkerAdapter:
             finished_retrieves.add(request_id)
 
             if not r_result:
-                self.error_block_ids.update(r_block_ids)
+                self._report_load_error(request_id, r_block_ids)
                 logger.error(
                     "Something went wrong when processing the "
                     "retrieve request for request_id=%s, result=%s",
@@ -2324,11 +2334,51 @@ class LMCacheMPWorkerAdapter:
         """
         return self.blocks_in_chunk
 
+    def set_hma_required(self, is_hma_required: bool) -> None:
+        """Select the KV load-failure reporting mode for this worker.
+
+        Args:
+            is_hma_required: True when the engine uses a hybrid/multi-group KV
+                cache layout, in which case block IDs are not globally unique
+                and failures must be reported per request instead.
+        """
+        self._is_hma_required = is_hma_required
+
+    def _report_load_error(self, request_id: str, block_ids: Iterable[int]) -> None:
+        """Record a failed KV load in whichever form the scheduler can use.
+
+        Args:
+            request_id: The request whose remote KV load failed.
+            block_ids: The destination blocks that failed, used only for
+                single-group layouts where block IDs are globally unique.
+        """
+        if self._is_hma_required:
+            self._failed_recv_reqs.add(request_id)
+        else:
+            self.error_block_ids.update(block_ids)
+
+    def get_and_clear_failed_recv_requests(self) -> set[str]:
+        """Return request ids whose KV load failed, then clear them.
+
+        Only populated under a hybrid/multi-group layout; single-group
+        deployments keep reporting via ``get_block_ids_with_load_errors``.
+        """
+        failed = self._failed_recv_reqs
+        self._failed_recv_reqs = set()
+        return failed
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
         Returns the block IDs that failed due to retrieve timeout,
         then clears the internal set.
+
+        Always empty under a hybrid/multi-group layout: block IDs are only
+        unique within a group there, so reporting them would make the
+        scheduler raise. Those failures go out via
+        ``get_and_clear_failed_recv_requests`` instead.
         """
+        if self._is_hma_required:
+            return set()
         errors = self.error_block_ids.copy()
         self.error_block_ids.clear()
         return errors

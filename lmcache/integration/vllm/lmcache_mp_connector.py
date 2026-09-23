@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 import math
 import sys
@@ -30,6 +31,27 @@ except ImportError:
     # legacy single-group behavior.
     class SupportsHMA:  # type: ignore[no-redef]
         pass
+
+
+try:
+    # Third Party
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorTransferResults,
+    )
+
+    _HAS_TRANSFER_RESULTS = True
+except ImportError:
+    # Older vLLM builds only offer block-level load-error reporting. Those
+    # builds also predate the multi-group scheduler check, so the legacy
+    # path stays correct there. Keep the name defined so the module stays
+    # importable and get_transfer_results stays syntactically valid.
+    _HAS_TRANSFER_RESULTS = False
+
+    @dataclass
+    class KVConnectorTransferResults:  # type: ignore[no-redef]
+        finished_sending: set[str] = field(default_factory=set)
+        finished_recving: set[str] = field(default_factory=set)
+        failed_recving: set[str] = field(default_factory=set)
 
 
 # Third Party
@@ -833,6 +855,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             layout_hints=layout_hints,
             dcp_size=self._dcp_size,
         )
+        # Mirror the scheduler's own test (_handle_invalid_blocks raises when
+        # len(kv_cache_config.kv_cache_groups) > 1). Use vLLM's group count,
+        # not len(engine_group_infos): the latter further splits groups by
+        # physical transfer identity and would over-trigger.
+        self.worker_adapter.set_hma_required(
+            _HAS_TRANSFER_RESULTS
+            and len(getattr(kv_cache_config, "kv_cache_groups", None) or ()) > 1
+        )
         self.worker_adapter.register_kv_caches(
             kv_caches,
             engine_group_infos=engine_group_infos,
@@ -1028,6 +1058,29 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
         # logger.error("Finished req ids: %s, %s", val[0], val[1])
         return val
+
+    def get_transfer_results(self, finished_req_ids: set[str]):
+        """Report completed transfers plus request-level KV load failures.
+
+        vLLM polls this every step and copies ``failed_recving`` into
+        ``KVConnectorOutput``. Reporting failures here (rather than only as
+        block IDs) is what lets the scheduler recover on a hybrid/multi-group
+        layout, where block IDs are not globally unique and the block-level
+        path raises instead.
+
+        Args:
+            finished_req_ids: Requests the engine has finished this step.
+
+        Returns:
+            A ``KVConnectorTransferResults`` with finished sends/recvs and any
+            requests whose remote KV load failed.
+        """
+        sending, recving = self.get_finished(finished_req_ids)
+        return KVConnectorTransferResults(
+            finished_sending=set(sending or ()),
+            finished_recving=set(recving or ()),
+            failed_recving=self.worker_adapter.get_and_clear_failed_recv_requests(),
+        )
 
     def build_connector_worker_meta(self):
         if not self.lazy_offload:
